@@ -380,6 +380,9 @@ def cmd_portal_eid_pushes(ctx: Ctx) -> int:
 
 
 def cmd_portal_enums(ctx: Ctx) -> int:
+    unknown = [n for n in ctx.args.names if n not in ENUM_NAMES]
+    if unknown:
+        raise UsageError(f"unknown enum name {unknown[0]!r}; choose from: {', '.join(ENUM_NAMES)}")
     names = list(ctx.args.names) or list(ENUM_NAMES)
     obj = _need_dict(_read(ctx, portal.PATH_ENUM_LIST, {"enumNames": names}), "enum list")
     view = sanitize(obj, ctx.redactor)
@@ -741,7 +744,8 @@ def register(s, leaf) -> None:
     p.add_argument("--reveal-ac", action="store_true", help="show activation codes in full")
 
     p = leaf(s, "enums", "the portal's enum values (statuses, config types)", cmd_portal_enums)
-    p.add_argument("names", nargs="*", choices=ENUM_NAMES, metavar="NAME",
+    # Names are checked in cmd_portal_enums: Python 3.11's argparse rejects an empty nargs="*" list with choices.
+    p.add_argument("names", nargs="*", metavar="NAME",
                    help="any of: " + ", ".join(ENUM_NAMES) + " (default: all)")
 
     leaf(s, "stats", "dashboard numbers: downloads, profiles by status, device brands", cmd_portal_stats)
