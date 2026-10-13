@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "simlessly-cli"
+version = "0.1.0"
+description = "Command-line client for the Simlessly RSP API (eSIM profiles and activation codes)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["esim", "rsp", "simlessly", "activation-code", "cli"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Telecommunications Industry",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Utilities",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/ripclap/simlessly-cli"
+Repository = "https://github.com/ripclap/simlessly-cli"
+
+[project.scripts]
+simlessly = "simlessly_cli.cli:main_entry"
+
+[tool.setuptools.packages.find]
+where = ["src"]
