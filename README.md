@@ -214,26 +214,23 @@ tests) and calls only ten fixed paths. Redirects are refused; responses over 1 M
 
 ## API change watch
 
-A GitHub Actions workflow (`.github/workflows/api-watch.yml`) checks the Simlessly API once a week (Mondays, 14:00 UTC,
-and on demand from the Actions tab). `tools/api_watch.py` reads the public documentation at `docs.simlessly.com` and the
-web portal's front-end files at `rsp.simlessly.com`, and compares them with the committed snapshot in `api-snapshot/`:
+A GitHub Actions workflow (`.github/workflows/api-watch.yml`) checks the web portal once a week (Mondays, 14:00 UTC,
+and on demand from the Actions tab). `tools/api_watch.py` reads the portal's public front-end files at
+`rsp.simlessly.com`, the same JavaScript every visitor downloads to see the login page, and compares them with the
+committed snapshot `api-snapshot/portal.json`: every `/api/` path the front-end calls, with its HTTP method, how the
+request is sent (JSON body, query string, file upload) and the page module that uses it. The request helpers are
+identified by what they do (setting `params` is a GET, setting `data` is a POST, a `FormData` body is an upload), not by
+their minified names. A name that is defined as two different kinds of helper is not trusted: calls through it are left
+unclassified. The page module is context only; a front-end rebuild that moves a path to another chunk is not a change.
 
-- `docs.json`: for each endpoint in the RSP, eIM and CMP API reference, the method, URL, and request and response fields
-  (name, type, required).
-- `portal.json`: every `/api/` path the portal front-end calls, with its HTTP method, how the request is sent (JSON
-  body, query string, file upload) and the page module that uses it. The request helpers are identified by what they do
-  (setting `params` is a GET, setting `data` is a POST, a `FormData` body is an upload), not by their minified names.
-  A name that is defined as two different kinds of helper is not trusted: calls through it are left unclassified.
-  The page module is context only; a front-end rebuild that moves a path to another chunk is not a change.
-
-Only static pages and scripts are fetched. No `/api/` endpoint is called and nothing is signed in.
+Only static files are fetched. No `/api/` endpoint is called and nothing is signed in. The API documentation is not
+read by the workflow and is not stored in the repository.
 
 If anything changed, the workflow runs the unit tests and opens or updates one pull request (branch `api-watch/update`)
-with the new snapshot and a report of the differences. The pull request is a draft when the tests fail. If the pages
+with the new snapshot and a report of the differences. The pull request is a draft when the tests fail. If the files
 cannot be read or their structure is not recognized, the run fails and no pull request is made. A snapshot is also
-refused when it looks like a misreading: far fewer endpoints, documentation endpoints that lost their method or URL,
-many portal paths without a known method, a path the CLI uses that cannot be classified, or more than five portal
-methods (or 10% of them) changing at once.
+refused when it looks like a misreading: far fewer paths, many paths without a known method, a path the CLI uses that
+cannot be classified, or more than five methods (or 10%) changing at once.
 
 Applied automatically: the HTTP method of a portal path in the read group of `src/simlessly_cli/portal_endpoints.json`,
 when the portal now uses another method. Nothing else in the code changes, so the commands that use that path still
@@ -242,8 +239,8 @@ to stay a draft, until the command is adapted by hand.
 
 Needs manual follow-up, listed in the pull request: method changes in the session and write groups (the login must stay
 a POST, and the CLI refuses to load a write path that is not), new portal paths (never added to the allowlist),
-allowlisted paths that disappeared, changes in how a request is sent, and changes to documented RSP API fields or
-endpoints. Only a person adds a path or moves it between the session, read and write groups.
+allowlisted paths that disappeared, and changes in how a request is sent. Only a person adds a path or moves it between
+the session, read and write groups.
 
 The workflow does not store its token in the git configuration; only the last steps receive it. It never overwrites commits
 that a person pushed to `api-watch/update` (it then only refreshes the pull request text), pushes with a lease, marks the
@@ -252,15 +249,34 @@ pull request as a draft again when the tests fail, and closes the pull request w
 Run it locally:
 
 ```sh
-python3 tools/api_watch.py snapshot --out /tmp/api-new     # about four minutes: one request every 0.3 s; --force skips the sanity checks
+python3 tools/api_watch.py snapshot --out /tmp/api-new     # --force skips the sanity checks
 python3 tools/api_watch.py diff --new /tmp/api-new --report report.md
 python3 tools/api_watch.py apply --new /tmp/api-new --report report.md
-cp /tmp/api-new/*.json api-snapshot/
+cp /tmp/api-new/portal.json api-snapshot/
 ```
 
-`diff` without `--new` fetches the live pages itself. In the repository settings, Actions must be allowed to create pull
+`diff` without `--new` fetches the live files itself. In the repository settings, Actions must be allowed to create pull
 requests (Settings, Actions, General, Workflow permissions). GitHub pauses scheduled workflows after 60 days without
 repository activity.
+
+### Documentation check (local)
+
+The API documentation at `docs.simlessly.com` is for signed-in customers, so it is checked on your own machine and never
+committed. `docs-check` needs a stored portal session (`simlessly portal login`). It first checks the session the way the
+documentation site does (one `POST /api/v1/plan/queryOrder`), and only then fetches the documentation pages, sending the
+session as the `simlessly_token` cookie. It stops with `sign in first: simlessly portal login` when there is no session or
+the portal does not accept it.
+
+```sh
+python3 tools/api_watch.py docs-check --update    # store the current documentation as the baseline
+python3 tools/api_watch.py docs-check             # print what changed since then; exit 0: none, 1: changes
+python3 tools/api_watch.py docs-check --report changes.md   # same, into a file (also outside the repository)
+```
+
+The snapshot is kept in `~/.config/simlessly-cli/docs-snapshot.json` (or `$XDG_CONFIG_HOME/simlessly-cli/`, or the path in
+`SIMLESSLY_DOCS_SNAPSHOT`), readable by you only (file mode 0600, directory 0700). A path inside a git work tree is
+refused, and `.gitignore` lists `docs-snapshot.json` and `api-snapshot/docs.json`. A reading with far fewer endpoints than
+the stored snapshot is refused; `--force` skips that check.
 
 ## Development
 

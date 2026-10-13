@@ -1,27 +1,36 @@
 #!/usr/bin/env python3
-"""Watch the Simlessly API documentation and the web portal for changes.
+"""Watch the Simlessly web portal's API calls, and (locally, signed in) the API documentation.
 
-Commands:
+Commands used by the weekly GitHub job. They cover the web portal only:
 
-  snapshot   Fetch the public documentation pages and the portal's front-end files and write two
-             normalized JSON files: docs.json (RSP, eIM and CMP API reference) and portal.json
-             (every /api/ path the portal front-end calls, with its HTTP method).
-  diff       Compare a new snapshot with the committed one and write a Markdown report.
-  apply      Update the HTTP method of portal paths in the CLI's read group
-             (src/simlessly_cli/portal_endpoints.json) when the portal changed it. It never adds
-             a path, never moves a path between groups, and never changes the session or write
-             groups (those are reported for a person to handle).
+  snapshot     Fetch the portal's front-end files and write api-snapshot/portal.json (every /api/ path
+               the portal front-end calls, with its HTTP method).
+  diff         Compare a new snapshot with the committed one and write a Markdown report.
+  apply        Update the HTTP method of portal paths in the CLI's read group
+               (src/simlessly_cli/portal_endpoints.json) when the portal changed it. It never adds
+               a path, never moves a path between groups, and never changes the session or write
+               groups (those are reported for a person to handle).
 
-Only public documentation pages and the portal's static front-end files are fetched. No /api/
-endpoint is ever requested and nothing is signed in. Standard library only.
+Command for a customer on their own machine:
+
+  docs-check   Compare the API documentation with a private snapshot kept outside the repository.
+               The documentation is for signed-in customers, so this needs a stored portal session
+               (`simlessly portal login`). The snapshot and any report are never written inside a git
+               work tree.
+
+snapshot, diff and apply fetch only the portal's public static files. No /api/ endpoint is requested
+and nothing is signed in. docs-check calls one /api/ path, the one the documentation site itself uses
+to check the session. Standard library only.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -32,6 +41,11 @@ from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parent.parent
 SNAPSHOT_DIR = ROOT / "api-snapshot"
+CONFIG_DIR_NAME = "simlessly-cli"
+DOCS_SNAPSHOT_FILE = "docs-snapshot.json"
+DOCS_SNAPSHOT_ENV = "SIMLESSLY_DOCS_SNAPSHOT"
+SESSION_COOKIE = "simlessly_token"
+SIGN_IN_FIRST = "sign in first: simlessly portal login"
 ENDPOINTS_FILE = ROOT / "src" / "simlessly_cli" / "portal_endpoints.json"
 
 DOCS_BASE = "https://docs.simlessly.com"
@@ -44,7 +58,7 @@ MAX_BYTES = 8 << 20
 
 SCHEMA = 1
 HTTP_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE")
-# A snapshot with far fewer entries than the committed one is treated as a failed scrape.
+# A snapshot with far fewer entries than the stored one is treated as a failed scrape.
 MIN_DOC_PAGES = 5
 MIN_DOC_ENDPOINTS = 10
 MIN_PORTAL_PATHS = 20
@@ -64,11 +78,16 @@ class WatchError(Exception):
 # ======================================================================================== fetching
 
 class Fetcher:
-    """Sequential, polite GET of public pages. Callable: fetcher(url) -> text."""
+    """Sequential, polite GET of pages. Callable: fetcher(url) -> text.
 
-    def __init__(self, delay: float = REQUEST_DELAY, timeout: float = REQUEST_TIMEOUT) -> None:
+    With `session_token`, requests to the documentation host carry it as the simlessly_token cookie, as a
+    signed-in browser sends it. It is never sent to another host, and redirects are not followed."""
+
+    def __init__(self, delay: float = REQUEST_DELAY, timeout: float = REQUEST_TIMEOUT,
+                 session_token: str | None = None) -> None:
         self.delay = delay
         self.timeout = timeout
+        self._token = session_token
         self._last = 0.0
         self._opener = urllib.request.build_opener(_NoRedirect())
 
@@ -81,7 +100,10 @@ class Fetcher:
         for attempt in range(3):
             if attempt:
                 time.sleep(2.0 * attempt)
-            request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html,*/*"})
+            headers = {"User-Agent": USER_AGENT, "Accept": "text/html,*/*"}
+            if self._token and urlsplit(url).hostname == urlsplit(DOCS_BASE).hostname:
+                headers["Cookie"] = f"{SESSION_COOKIE}={self._token}"
+            request = urllib.request.Request(url, headers=headers)
             try:
                 with self._opener.open(request, timeout=self.timeout) as response:
                     body = response.read(MAX_BYTES + 1)
@@ -112,7 +134,7 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def check_url(url: str) -> None:
-    """Only https pages on the two public hosts, and never an /api/ path."""
+    """Only https pages on the two Simlessly hosts, and never an /api/ path."""
     parts = urlsplit(url)
     if parts.scheme != "https" or parts.hostname not in ALLOWED_HOSTS:
         raise WatchError(f"refusing to fetch {url}: not an https page on {', '.join(sorted(ALLOWED_HOSTS))}")
@@ -641,10 +663,10 @@ def dump_json(data: Any) -> str:
     return json.dumps(data, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
 
 
-def load_snapshot(directory: Path) -> tuple[dict, dict]:
+def load_snapshot(directory: Path) -> dict:
+    """The portal snapshot (portal.json) in a directory."""
     try:
-        return (json.loads((directory / "docs.json").read_text(encoding="utf-8")),
-                json.loads((directory / "portal.json").read_text(encoding="utf-8")))
+        return json.loads((directory / "portal.json").read_text(encoding="utf-8"))
     except (OSError, ValueError) as err:
         raise WatchError(f"cannot read the snapshot in {directory}: {err}") from None
 
@@ -668,10 +690,9 @@ def _page_counts(page: dict) -> tuple[int, int]:
     return resolved, len(page["endpoints"]) - resolved
 
 
-def check_snapshot(docs: dict, portal: dict, baseline: tuple[dict, dict] | None, groups: dict,
-                   rsp_paths: set[str]) -> None:
-    """Refuse a snapshot that is a failed or degraded reading of the sites rather than an API change.
-    Raises WatchError. `baseline` is the committed (docs, portal) pair, if there is one."""
+def check_snapshot(portal: dict, baseline: dict | None, groups: dict) -> None:
+    """Refuse a portal snapshot that is a failed or degraded reading of the site rather than an API change.
+    Raises WatchError. `baseline` is the committed portal snapshot, if there is one."""
     for path, group in cli_portal_paths(groups).items():
         entry = portal["endpoints"].get(path)
         if entry and entry["method"] in ("UNKNOWN", "CONFLICT"):
@@ -679,23 +700,32 @@ def check_snapshot(docs: dict, portal: dict, baseline: tuple[dict, dict] | None,
                              f"({entry['method']}, {entry['transport']}); refusing to write the snapshot")
     if baseline is None:
         return
-    old_docs, old_portal = baseline
-    for label, new_n, old_n in (("documentation endpoints", count_docs(docs), count_docs(old_docs)),
-                                ("portal paths", len(portal["endpoints"]), len(old_portal["endpoints"]))):
-        if old_n and new_n < old_n * SHRINK_LIMIT:
-            raise WatchError(f"{label}: {new_n} found, {old_n} in the committed snapshot; "
-                             "refusing to write it (the scrape probably failed)")
-    for label, new_n, old_n in (("documentation endpoints with a method and URL", _resolved_docs(docs), _resolved_docs(old_docs)),
-                                ("portal paths with a known method", _resolved_portal(portal), _resolved_portal(old_portal))):
-        if old_n and new_n < old_n * (1 - RESOLVED_DROP_LIMIT):
-            raise WatchError(f"{label}: {new_n} found, {old_n} in the committed snapshot; "
-                             "refusing to write it (the site structure probably changed)")
-    old_eps, new_eps = old_portal["endpoints"], portal["endpoints"]
+    new_n, old_n = len(portal["endpoints"]), len(baseline["endpoints"])
+    if old_n and new_n < old_n * SHRINK_LIMIT:
+        raise WatchError(f"portal paths: {new_n} found, {old_n} in the committed snapshot; "
+                         "refusing to write it (the scrape probably failed)")
+    new_n, old_n = _resolved_portal(portal), _resolved_portal(baseline)
+    if old_n and new_n < old_n * (1 - RESOLVED_DROP_LIMIT):
+        raise WatchError(f"portal paths with a known method: {new_n} found, {old_n} in the committed snapshot; "
+                         "refusing to write it (the site structure probably changed)")
+    old_eps, new_eps = baseline["endpoints"], portal["endpoints"]
     flipped = [p for p in old_eps.keys() & new_eps.keys() if old_eps[p]["method"] != new_eps[p]["method"]]
     if len(flipped) > MAX_METHOD_CHANGES or (old_eps and len(flipped) > len(old_eps) * METHOD_CHANGE_SHARE):
         raise WatchError(f"portal: the method of {len(flipped)} of {len(old_eps)} paths changed at once "
                          f"({', '.join(sorted(flipped)[:3])}, ...); that is more likely a misreading of the front-end "
                          "than an API change. Refusing to write the snapshot (use --force after checking by hand)")
+
+
+def check_docs(docs: dict, old_docs: dict, rsp_paths: set[str]) -> None:
+    """Refuse a documentation reading that is a failed or degraded scrape rather than a change of the documentation."""
+    new_n, old_n = count_docs(docs), count_docs(old_docs)
+    if old_n and new_n < old_n * SHRINK_LIMIT:
+        raise WatchError(f"documentation endpoints: {new_n} found, {old_n} in the stored snapshot; "
+                         "refusing to use it (the scrape probably failed)")
+    new_n, old_n = _resolved_docs(docs), _resolved_docs(old_docs)
+    if old_n and new_n < old_n * (1 - RESOLVED_DROP_LIMIT):
+        raise WatchError(f"documentation endpoints with a method and URL: {new_n} found, {old_n} in the stored snapshot; "
+                         "refusing to use it (the site structure probably changed)")
     for path in sorted(rsp_paths):                       # a CLI call whose documentation page is still there but unreadable
         for page_path, page in old_docs["pages"].items():
             if not any(_url_path(e["url"]) == path for e in page["endpoints"]) or page_path not in docs["pages"]:
@@ -704,7 +734,7 @@ def check_snapshot(docs: dict, portal: dict, baseline: tuple[dict, dict] | None,
             new_resolved, new_open = _page_counts(docs["pages"][page_path])
             if new_resolved < old_resolved and new_open > old_open:
                 raise WatchError(f"documentation page {page_path} (documents {path}, which the CLI calls) lost the method "
-                                 "or URL of an endpoint; refusing to write the snapshot")
+                                 "or URL of an endpoint; refusing to use it (--force skips this check)")
 
 
 def keep_known_modules(portal: dict, old_portal: dict) -> None:
@@ -718,20 +748,17 @@ def keep_known_modules(portal: dict, old_portal: dict) -> None:
 
 def cmd_snapshot(args: argparse.Namespace, fetch: Callable[[str], str] | None = None) -> int:
     fetch = fetch or Fetcher()
-    docs = collect_docs(fetch)
     portal = scan_portal(fetch)
-    baseline_dir = Path(args.baseline)
-    baseline = load_snapshot(baseline_dir) if (baseline_dir / "docs.json").exists() and (baseline_dir / "portal.json").exists() else None
+    baseline_file = Path(args.baseline) / "portal.json"
+    baseline = load_snapshot(Path(args.baseline)) if baseline_file.exists() else None
     if not args.force:
-        check_snapshot(docs, portal, baseline, load_endpoint_groups(Path(args.endpoints)), cli_rsp_paths())
+        check_snapshot(portal, baseline, load_endpoint_groups(Path(args.endpoints)))
     if baseline:
-        keep_known_modules(portal, baseline[1])
+        keep_known_modules(portal, baseline)
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    (out / "docs.json").write_text(dump_json(docs), encoding="utf-8")
     (out / "portal.json").write_text(dump_json(portal), encoding="utf-8")
-    print(f"snapshot written to {out}: {len(docs['pages'])} documentation pages, {count_docs(docs)} endpoints, "
-          f"{len(portal['endpoints'])} portal paths")
+    print(f"snapshot written to {out}: {len(portal['endpoints'])} portal paths")
     return 0
 
 
@@ -881,48 +908,10 @@ def plan_apply(groups: dict, new_portal: dict) -> dict:
     return {"applied": applied, "skipped": skipped, "missing": missing}
 
 
-def build_report(old_docs: dict, new_docs: dict, old_portal: dict, new_portal: dict, groups: dict,
-                 rsp_paths: set[str]) -> str:
-    docs = diff_docs(old_docs, new_docs)
-    portal = diff_portal(old_portal, new_portal)
-    allow = cli_portal_paths(groups)
-    plan = plan_apply(groups, new_portal)
-
-    docs_total = len(docs["added"]) + len(docs["removed"]) + len(docs["changed"]) + len(docs["pages_added"]) \
-        + len(docs["pages_removed"]) + len(docs["unavailable_added"]) + len(docs["unavailable_removed"])
-    portal_total = len(portal["added"]) + len(portal["removed"]) + len(portal["changed"]) + len(portal["other"])
-    lines = ["# API change report", ""]
-    if old_docs == new_docs and same_portal(old_portal, new_portal):
-        lines += ["No changes since the committed snapshot.", ""]
-        return "\n".join(lines)
-    lines += ["## Summary", "",
-              f"- Documentation: {len(docs['added'])} endpoints added, {len(docs['removed'])} removed, "
-              f"{len(docs['changed'])} changed.",
-              f"- Portal: {len(portal['added'])} paths added, {len(portal['removed'])} removed, "
-              f"{len(portal['changed'])} changed.", ""]
-
-    manual: list[str] = []
-    for path in portal["removed"]:
-        if path in allow:
-            manual.append(f"Portal path {_code(path)} ({allow[path]} group) is no longer called by the portal front-end. "
-                          "Check whether the command that uses it still works.")
-    for path, reason in plan["skipped"]:
-        manual.append(f"Portal path {_code(path)} changed, not applied: {reason}.")
-    for path in plan["missing"]:
-        if path not in portal["removed"]:
-            manual.append(f"Portal path {_code(path)} is not in the new snapshot.")
-    for key in docs["removed"]:
-        if _url_path(docs["old_endpoints"][key]["url"]) in rsp_paths:
-            manual.append(f"Documentation for {_code(key)}, which the CLI calls, was removed.")
-    for key, notes in docs["changed"].items():
-        if _url_path(docs["new_endpoints"][key]["url"]) in rsp_paths:
-            manual.append(f"Documentation for {_code(key)}, which the CLI calls, changed: " + "; ".join(notes[:6])
-                          + (f"; and {len(notes) - 6} more" if len(notes) > 6 else "") + ".")
-    if manual:
-        lines += ["## Needs manual follow-up", ""] + [f"- {m}" for m in manual] + [""]
-
-    lines += ["## Portal", ""]
-    if portal_total == 0:
+def _portal_section(portal: dict, allow: dict[str, str]) -> list[str]:
+    total = len(portal["added"]) + len(portal["removed"]) + len(portal["changed"]) + len(portal["other"])
+    lines = ["## Portal", ""]
+    if total == 0:
         lines += ["No changes.", ""]
     if portal["changed"]:
         lines += ["### Changed paths", ""]
@@ -944,6 +933,61 @@ def build_report(old_docs: dict, new_docs: dict, old_portal: dict, new_portal: d
         lines.append("")
     if portal["other"]:
         lines += ["### Session details", ""] + [f"- {t}" for t in portal["other"]] + [""]
+    return lines
+
+
+def build_report(old_portal: dict, new_portal: dict, groups: dict) -> str:
+    """The Markdown report of a portal change (the weekly job's pull request text)."""
+    portal = diff_portal(old_portal, new_portal)
+    allow = cli_portal_paths(groups)
+    plan = plan_apply(groups, new_portal)
+
+    lines = ["# API change report", ""]
+    if same_portal(old_portal, new_portal):
+        lines += ["No changes since the committed snapshot.", ""]
+        return "\n".join(lines)
+    lines += ["## Summary", "",
+              f"- Portal: {len(portal['added'])} paths added, {len(portal['removed'])} removed, "
+              f"{len(portal['changed'])} changed.", ""]
+
+    manual: list[str] = []
+    for path in portal["removed"]:
+        if path in allow:
+            manual.append(f"Portal path {_code(path)} ({allow[path]} group) is no longer called by the portal front-end. "
+                          "Check whether the command that uses it still works.")
+    for path, reason in plan["skipped"]:
+        manual.append(f"Portal path {_code(path)} changed, not applied: {reason}.")
+    for path in plan["missing"]:
+        if path not in portal["removed"]:
+            manual.append(f"Portal path {_code(path)} is not in the new snapshot.")
+    if manual:
+        lines += ["## Needs manual follow-up", ""] + [f"- {m}" for m in manual] + [""]
+    return "\n".join(lines + _portal_section(portal, allow))
+
+
+def build_docs_report(old_docs: dict, new_docs: dict, rsp_paths: set[str]) -> str:
+    """The Markdown report of a documentation change (printed on the customer's machine by docs-check)."""
+    docs = diff_docs(old_docs, new_docs)
+    docs_total = len(docs["added"]) + len(docs["removed"]) + len(docs["changed"]) + len(docs["pages_added"]) \
+        + len(docs["pages_removed"]) + len(docs["unavailable_added"]) + len(docs["unavailable_removed"])
+    lines = ["# Documentation change report", ""]
+    if old_docs == new_docs:
+        lines += ["No changes since the stored snapshot.", ""]
+        return "\n".join(lines)
+    lines += ["## Summary", "",
+              f"- Documentation: {len(docs['added'])} endpoints added, {len(docs['removed'])} removed, "
+              f"{len(docs['changed'])} changed.", ""]
+
+    manual: list[str] = []
+    for key in docs["removed"]:
+        if _url_path(docs["old_endpoints"][key]["url"]) in rsp_paths:
+            manual.append(f"Documentation for {_code(key)}, which the CLI calls, was removed.")
+    for key, notes in docs["changed"].items():
+        if _url_path(docs["new_endpoints"][key]["url"]) in rsp_paths:
+            manual.append(f"Documentation for {_code(key)}, which the CLI calls, changed: " + "; ".join(notes[:6])
+                          + (f"; and {len(notes) - 6} more" if len(notes) > 6 else "") + ".")
+    if manual:
+        lines += ["## Needs manual follow-up", ""] + [f"- {m}" for m in manual] + [""]
 
     lines += ["## Documentation", ""]
     if docs_total == 0:
@@ -979,26 +1023,25 @@ def build_report(old_docs: dict, new_docs: dict, old_portal: dict, new_portal: d
     return "\n".join(lines)
 
 
-def cap_report(text: str) -> str:
+def cap_report(text: str, full_data: str = "The snapshot files in `api-snapshot/` have the full data.") -> str:
     if len(text) <= REPORT_LIMIT:
         return text
-    return text[:REPORT_LIMIT].rsplit("\n", 1)[0] + "\n\n(Report shortened. The snapshot files in `api-snapshot/` have the full data.)\n"
+    return text[:REPORT_LIMIT].rsplit("\n", 1)[0] + f"\n\n(Report shortened. {full_data})\n"
 
 
 def cmd_diff(args: argparse.Namespace, fetch: Callable[[str], str] | None = None) -> int:
-    old_docs, old_portal = load_snapshot(Path(args.old))
+    old_portal = load_snapshot(Path(args.old))
     if args.new:
-        new_docs, new_portal = load_snapshot(Path(args.new))
+        new_portal = load_snapshot(Path(args.new))
     else:
-        fetch = fetch or Fetcher()
-        new_docs, new_portal = collect_docs(fetch), scan_portal(fetch)
-    report = cap_report(build_report(old_docs, new_docs, old_portal, new_portal, load_endpoint_groups(), cli_rsp_paths()))
+        new_portal = scan_portal(fetch or Fetcher())
+    report = cap_report(build_report(old_portal, new_portal, load_endpoint_groups()))
     if args.report:
         Path(args.report).write_text(report, encoding="utf-8")
     else:
         sys.stdout.write(report)
-    changed = old_docs != new_docs or not same_portal(old_portal, new_portal)
-    print("snapshot differs from the committed one" if changed else "no changes", file=sys.stderr)
+    print("snapshot differs from the committed one" if not same_portal(old_portal, new_portal) else "no changes",
+          file=sys.stderr)
     return 0
 
 
@@ -1030,7 +1073,7 @@ def apply_section(plan: dict) -> str:
 def cmd_apply(args: argparse.Namespace) -> int:
     endpoints_file = Path(args.endpoints)
     groups = load_endpoint_groups(endpoints_file)
-    _, new_portal = load_snapshot(Path(args.new))
+    new_portal = load_snapshot(Path(args.new))
     updated, plan = apply_methods(groups, new_portal)
     if updated != groups:
         endpoints_file.write_text(json.dumps(updated, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -1043,13 +1086,190 @@ def cmd_apply(args: argparse.Namespace) -> int:
     return 0
 
 
+# ======================================================================================== docs-check (local, signed in)
+
+# A cookie value as RFC 6265 allows it: printable ASCII without space, quote, comma, semicolon and backslash.
+_COOKIE_VALUE_RE = re.compile(r"[\x21\x23-\x2b\x2d-\x3a\x3c-\x5b\x5d-\x7e]+")
+
+
+def _cli_modules() -> tuple[Any, Any, Any, Any, Any]:
+    """The CLI's own modules: settings, secret stores, portal client, output redaction."""
+    sys.path.insert(0, str(ROOT / "src"))
+    try:
+        from simlessly_cli import client, config, output, portal, store
+        return client, config, output, portal, store
+    finally:
+        sys.path.pop(0)
+
+
+def docs_snapshot_path(env: Any) -> tuple[Path, bool]:
+    """(path of the private documentation snapshot, whether it is in the default config directory).
+    $SIMLESSLY_DOCS_SNAPSHOT, else $XDG_CONFIG_HOME/simlessly-cli/docs-snapshot.json, else
+    ~/.config/simlessly-cli/docs-snapshot.json (the directory of the credentials file)."""
+    explicit = (env.get(DOCS_SNAPSHOT_ENV) or "").strip()
+    if explicit:
+        return Path(explicit).expanduser(), False
+    xdg = (env.get("XDG_CONFIG_HOME") or "").strip()
+    try:
+        base = Path(xdg) if xdg and os.path.isabs(xdg) else Path.home() / ".config"
+    except RuntimeError:
+        raise WatchError(f"no home directory, so there is no default snapshot location; set {DOCS_SNAPSHOT_ENV}") from None
+    return base / CONFIG_DIR_NAME / DOCS_SNAPSHOT_FILE, True
+
+
+def work_tree_of(path: Path) -> Path | None:
+    """The git work tree (or this repository) that contains `path`, once symbolic links are resolved; else None."""
+    real = Path(os.path.realpath(path))
+    for directory in (real, *real.parents):
+        if directory == ROOT or (directory / ".git").exists():
+            return directory
+    return None
+
+
+def private_target(path: Path, what: str) -> Path:
+    """The resolved location for a file that holds documentation content. Refuses a path inside a git work tree."""
+    tree = work_tree_of(path)
+    if tree is not None:
+        raise WatchError(f"refusing to write the {what} to {path}: it is inside the git work tree {tree}. The documentation "
+                         f"is for signed-in customers and must not be committed. Use a path outside any repository"
+                         + (f" ({DOCS_SNAPSHOT_ENV} sets the snapshot location)" if what == "snapshot" else ""))
+    return Path(os.path.realpath(path))
+
+
+def write_private_file(target: Path, text: str, *, make_dirs: bool, tighten_dir: bool = False) -> None:
+    """Atomic write of a file readable by the owner only. New directories are created with mode 0700."""
+    posix = os.name == "posix"
+    parent = target.parent
+    try:
+        if make_dirs:
+            missing = []
+            directory = parent
+            while not directory.exists():
+                missing.append(directory)
+                directory = directory.parent
+            for directory in reversed(missing):
+                directory.mkdir(mode=0o700)
+                if posix:
+                    os.chmod(directory, 0o700)
+            if posix and not missing and parent.stat().st_mode & 0o077:
+                if tighten_dir:
+                    os.chmod(parent, 0o700)
+                else:
+                    print(f"api_watch: warning: {parent} can be read by other users", file=sys.stderr)
+        fd, tmp_name = tempfile.mkstemp(prefix=".docs-", dir=str(parent))
+    except OSError as err:
+        raise WatchError(f"could not write {target}: {err.strerror or type(err).__name__}") from None
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            if posix:
+                os.fchmod(handle.fileno(), 0o600)
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, target)
+    except OSError as err:
+        raise WatchError(f"could not write {target}: {err.strerror or type(err).__name__}") from None
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def load_docs_snapshot(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as err:
+        raise WatchError(f"cannot read the stored documentation snapshot {path}: {err}. "
+                         "Delete it, or run docs-check --update --force") from None
+    if not (isinstance(data, dict) and data.get("schema") == SCHEMA and isinstance(data.get("pages"), dict)
+            and isinstance(data.get("unavailable"), list)):
+        raise WatchError(f"{path} is not a documentation snapshot this version can read. "
+                         "Delete it, or run docs-check --update --force")
+    return data
+
+
+def signed_in_token(env: Any) -> tuple[str, Any]:
+    """The stored portal session token, checked the way the documentation site checks it. Returns (token, redactor).
+
+    The token comes from the CLI's settings in the CLI's order (environment, OS secret store, credentials file).
+    Raises WatchError, with "sign in first" in the message, when there is none or the portal does not accept it."""
+    client, config, output, portal, store = _cli_modules()
+    settings = config.Settings(env, config.keychain_lookup, file_store=store.CredentialsFile.for_env(env),
+                               keychain_source=store.os_store_name() or "keychain")
+    try:
+        token = settings.get("portal-token").value
+        base_url = settings.base_url()
+    except config.ConfigError as err:
+        raise WatchError(str(err)) from None
+    if not token:
+        raise WatchError(f"no portal session is stored; {SIGN_IN_FIRST}")
+    redactor = output.Redactor()
+    redactor.add(token)
+    if not _COOKIE_VALUE_RE.fullmatch(token):
+        raise WatchError(f"the stored portal token contains characters that cannot be sent; {SIGN_IN_FIRST}")
+    session = portal.PortalClient(base_url, token, timezone=portal.local_timezone({"TZ": settings.env_value("TZ") or ""}),
+                                  redactor=redactor)
+    try:
+        session.read(portal.PATH_PLAN_QUERY_ORDER, {})
+    except portal.PortalSessionExpired:
+        raise WatchError(f"the stored portal session is expired or invalid; {SIGN_IN_FIRST}") from None
+    except client.SimlesslyError as err:
+        raise WatchError("could not check the portal session: " + redactor.scrub(str(err))) from None
+    return token, redactor
+
+
+def cmd_docs_check(args: argparse.Namespace, fetch_factory: Callable[[str], Callable[[str], str]] | None = None) -> int:
+    env = os.environ
+    path, default_dir = docs_snapshot_path(env)
+    target = private_target(path, "snapshot")
+    report_target = private_target(Path(args.report), "report") if args.report else None
+    token, redactor = signed_in_token(env)
+    fetch = fetch_factory(token) if fetch_factory else Fetcher(session_token=token)
+    try:
+        docs = collect_docs(fetch)
+    except WatchError as err:
+        raise WatchError(redactor.scrub(str(err))) from None
+    old = None
+    if target.exists() and not (args.update and args.force):
+        old = load_docs_snapshot(target)
+    try:
+        if old is not None and not args.force:
+            check_docs(docs, old, cli_rsp_paths())
+        if args.update:
+            if old is not None and old != docs:
+                d = diff_docs(old, docs)
+                changes = (f"; since the previous one: {len(d['added'])} endpoints added, {len(d['removed'])} removed, "
+                           f"{len(d['changed'])} changed")
+            else:
+                changes = ""
+            write_private_file(target, dump_json(docs), make_dirs=True, tighten_dir=default_dir)
+            print(f"documentation snapshot written to {target}: {len(docs['pages'])} pages, {count_docs(docs)} endpoints"
+                  + changes)
+            return 0
+        if old is None:
+            raise WatchError(f"no documentation snapshot at {target} yet; run docs-check --update to create it")
+        report = cap_report(build_docs_report(old, docs, cli_rsp_paths()), "The stored snapshot has the full data.")
+    except (KeyError, TypeError, AttributeError):
+        raise WatchError(f"the stored documentation snapshot {target} has an unexpected structure. "
+                         "Delete it, or run docs-check --update --force") from None
+    if report_target:
+        write_private_file(report_target, report, make_dirs=False)
+    else:
+        sys.stdout.write(report)
+    changed = old != docs
+    print("documentation differs from the stored snapshot" if changed else "no changes", file=sys.stderr)
+    return 1 if changed else 0
+
+
 # ======================================================================================== main
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="api_watch.py", description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("snapshot", help="fetch the public pages and write docs.json and portal.json")
+    p = sub.add_parser("snapshot", help="fetch the portal's front-end files and write portal.json")
     p.add_argument("--out", default=str(SNAPSHOT_DIR), help="output directory (default: api-snapshot)")
     p.add_argument("--baseline", default=str(SNAPSHOT_DIR), help="committed snapshot used to detect a failed scrape")
     p.add_argument("--endpoints", default=str(ENDPOINTS_FILE), help="the CLI's portal endpoint data file")
@@ -1058,7 +1278,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p = sub.add_parser("diff", help="compare a new snapshot with the committed one and write a Markdown report")
     p.add_argument("--old", default=str(SNAPSHOT_DIR), help="committed snapshot directory (default: api-snapshot)")
-    p.add_argument("--new", help="new snapshot directory; without it the live sites are fetched")
+    p.add_argument("--new", help="new snapshot directory; without it the live portal is fetched")
     p.add_argument("--report", help="write the report to this file instead of stdout")
     p.set_defaults(func=cmd_diff)
 
@@ -1067,6 +1287,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--endpoints", default=str(ENDPOINTS_FILE), help="the CLI's portal endpoint data file")
     p.add_argument("--report", help="append an 'Applied automatically' section to this report")
     p.set_defaults(func=cmd_apply)
+
+    p = sub.add_parser("docs-check", help="compare the API documentation with a private snapshot (needs a portal session)",
+                       description="Check the stored portal session, fetch the API documentation and compare it with the "
+                                   f"private snapshot (default ~/.config/simlessly-cli/{DOCS_SNAPSHOT_FILE}, or "
+                                   f"${DOCS_SNAPSHOT_ENV}). Exit 0: no changes. Exit 1: changes, or a refusal or error.")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--update", action="store_true", help="write the private snapshot instead of printing a report")
+    mode.add_argument("--report", help="write the change report to this file (outside any git work tree) instead of stdout")
+    p.add_argument("--force", action="store_true", help="skip the sanity checks against the stored snapshot")
+    p.set_defaults(func=cmd_docs_check)
 
     args = parser.parse_args(argv)
     try:

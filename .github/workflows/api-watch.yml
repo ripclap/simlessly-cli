@@ -1,8 +1,9 @@
 name: API change watch
 
-# Once a week, read the public Simlessly documentation and the web portal's front-end files, compare them with
-# api-snapshot/, update the HTTP method of read-group portal paths the CLI already uses, and open one pull request
-# with the result. Only static pages are fetched; no /api/ endpoint is called. See "API change watch" in the README.
+# Once a week, read the web portal's public front-end files, compare them with api-snapshot/portal.json, update the
+# HTTP method of read-group portal paths the CLI already uses, and open one pull request with the result. Only static
+# files are fetched; no /api/ endpoint is called. The API documentation is for signed-in customers and is not
+# read here. See "API change watch" in the README.
 #
 # The write token is not stored in the git configuration. Only the last steps receive it, after the pages have
 # been parsed and the tests have run.
@@ -42,7 +43,7 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Fetch the current documentation and portal data
+      - name: Fetch the current portal data
         run: python tools/api_watch.py snapshot --out "$RUNNER_TEMP/api-new"
 
       - name: Compare with the committed snapshot
@@ -51,7 +52,7 @@ jobs:
       - name: Update portal methods and install the new snapshot
         run: |
           python tools/api_watch.py apply --new "$RUNNER_TEMP/api-new" --report "$RUNNER_TEMP/report.md"
-          cp "$RUNNER_TEMP/api-new/docs.json" "$RUNNER_TEMP/api-new/portal.json" api-snapshot/
+          cp "$RUNNER_TEMP/api-new/portal.json" api-snapshot/
 
       - name: Check for changes
         id: changes
@@ -77,7 +78,7 @@ jobs:
         run: |
           set -eu
           gh auth setup-git
-          title="Update API snapshot"
+          title="Update portal API snapshot"
           git config user.name "github-actions[bot]"
           git config user.email "$BOT_EMAIL"
 
@@ -156,7 +157,7 @@ jobs:
           fi
           gh auth setup-git
           gh pr close "$number" --delete-branch \
-            --comment "The documentation and portal now match the snapshot on $BASE_BRANCH, so this pull request is no longer needed."
+            --comment "The portal now matches the snapshot on $BASE_BRANCH, so this pull request is no longer needed."
 
       - name: Fail the run if the tests failed
         if: steps.changes.outputs.changed == 'true' && steps.tests.outcome != 'success'

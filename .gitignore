@@ -14,3 +14,7 @@ venv/
 htmlcov/
 *.log
 .DS_Store
+
+# The API documentation is for signed-in customers: its snapshot is kept outside the repository.
+docs-snapshot.json
+api-snapshot/docs.json

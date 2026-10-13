@@ -4,14 +4,18 @@ import contextlib
 import copy
 import io
 import json
+import os
 import shutil
+import stat
 import sys
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
 import support  # noqa: F401  (network guard: any real request fails the test)
+from support import MockPortal, envelope, ok
 
 TOOLS = Path(__file__).resolve().parent.parent / "tools"
 sys.path.insert(0, str(TOOLS))
@@ -318,11 +322,22 @@ class DiffTests(unittest.TestCase):
         self.docs, self.portal = snapshots()
 
     def report(self, new_docs=None, new_portal=None, rsp_paths=()):
-        return api_watch.build_report(self.docs, new_docs or self.docs, self.portal, new_portal or self.portal,
-                                      GROUPS, set(rsp_paths))
+        """The portal report when only the portal changed, else the documentation report."""
+        if new_docs is None:
+            return api_watch.build_report(self.portal, new_portal or self.portal, GROUPS)
+        return api_watch.build_docs_report(self.docs, new_docs, set(rsp_paths))
 
     def test_identical_snapshots(self):
         self.assertEqual(self.report().strip(), "# API change report\n\nNo changes since the committed snapshot.")
+        self.assertEqual(api_watch.build_docs_report(self.docs, self.docs, set()).strip(),
+                         "# Documentation change report\n\nNo changes since the stored snapshot.")
+
+    def test_the_portal_report_does_not_mention_the_documentation(self):
+        new = copy.deepcopy(self.portal)
+        new["endpoints"]["/api/v1/things/detail"].update(method="POST", transport="json")
+        report = self.report(new_portal=new)
+        self.assertNotIn("Documentation", report)
+        self.assertNotIn("documentation", report)
 
     def test_portal_changes_are_listed(self):
         new = copy.deepcopy(self.portal)
@@ -390,7 +405,7 @@ class DiffTests(unittest.TestCase):
         for key in ("response_types", "request_types"):
             new["pages"]["/rsp/api-reference/items/list-things.html"]["endpoints"][0][key][payload].append(
                 {"name": "b", "type": "T", "required": True})
-        report = api_watch.build_report(old, new, self.portal, self.portal, GROUPS, set())
+        report = api_watch.build_docs_report(old, new, set())
         lines = [line for line in report.splitlines() if "added field `b" in line]
         self.assertEqual(len(lines), 2)
         for line in lines:
@@ -415,6 +430,8 @@ class DiffTests(unittest.TestCase):
         capped = api_watch.cap_report(text)
         self.assertLess(len(capped), api_watch.REPORT_LIMIT + 200)
         self.assertIn("Report shortened", capped)
+        self.assertIn("api-snapshot/", capped)
+        self.assertNotIn("api-snapshot/", api_watch.cap_report(text, "The stored snapshot has the full data."))
         self.assertEqual(api_watch.cap_report("short"), "short")
 
 
@@ -473,7 +490,7 @@ class ApplyTests(unittest.TestCase):
                          {"/api/v1/account/login", "/api/v1/account/logout", "/api/v1/things/delete"})
         new = copy.deepcopy(self.portal)
         edit(new["endpoints"])
-        report = api_watch.build_report(self.docs, self.docs, self.portal, new, GROUPS, set())
+        report = api_watch.build_report(self.portal, new, GROUPS)
         self.assertIn("## Needs manual follow-up", report)
         self.assertIn("Portal path `/api/v1/account/login` changed, not applied: its method changed from POST to GET "
                       "in the session group, which is only changed by hand.", report)
@@ -494,7 +511,7 @@ class ApplyTests(unittest.TestCase):
         old = copy.deepcopy(self.portal)
         new = copy.deepcopy(self.portal)
         del new["endpoints"]["/api/v1/things/render"]
-        report = api_watch.build_report(self.docs, self.docs, old, new, GROUPS, set())
+        report = api_watch.build_report(old, new, GROUPS)
         self.assertIn("Portal path `/api/v1/things/render` (read group) is no longer called", report)
 
     def test_a_path_is_never_moved_between_groups(self):
@@ -518,7 +535,7 @@ class ApplyTests(unittest.TestCase):
                           "/api/v1/things/render", "/api/v1/account/logout"})
         new = copy.deepcopy(self.portal)
         edit(new["endpoints"])
-        report = api_watch.build_report(self.docs, self.docs, self.portal, new, GROUPS, set())
+        report = api_watch.build_report(self.portal, new, GROUPS)
         self.assertIn("changed, not applied", report)
 
     def test_a_multipart_path_keeps_its_method_when_only_modules_change(self):
@@ -540,15 +557,17 @@ class SnapshotCheckTests(unittest.TestCase):
 
     def setUp(self):
         self.docs, self.portal = snapshots()
-        self.baseline = (self.docs, self.portal)
 
-    def check(self, docs=None, portal=None, baseline="default", groups=GROUPS, rsp=()):
-        api_watch.check_snapshot(docs or self.docs, portal or self.portal,
-                                 self.baseline if baseline == "default" else baseline, groups, set(rsp))
+    def check(self, portal=None, baseline="default", groups=GROUPS):
+        api_watch.check_snapshot(portal or self.portal, self.portal if baseline == "default" else baseline, groups)
+
+    def check_docs(self, docs, rsp=()):
+        api_watch.check_docs(docs, self.docs, set(rsp))
 
     def test_an_unchanged_snapshot_passes(self):
         self.check()
         self.check(baseline=None)
+        self.check_docs(self.docs)
 
     def test_a_cli_path_that_cannot_be_classified_is_refused_with_or_without_a_baseline(self):
         for method in ("UNKNOWN", "CONFLICT"):
@@ -577,7 +596,7 @@ class SnapshotCheckTests(unittest.TestCase):
             new = copy.deepcopy(old)
             for i in range(count):
                 new["endpoints"][f"/api/v1/p/{i}"]["method"] = "GET"
-            check = lambda: api_watch.check_snapshot(self.docs, new, (self.docs, old), GROUPS, set())      # noqa: E731
+            check = lambda: api_watch.check_snapshot(new, old, GROUPS)      # noqa: E731
             if ok:
                 check()
             else:
@@ -591,7 +610,7 @@ class SnapshotCheckTests(unittest.TestCase):
                 e["method"] = e["url"] = None
         self.assertEqual(api_watch.count_docs(new), api_watch.count_docs(self.docs))
         with self.assertRaisesRegex(api_watch.WatchError, "documentation endpoints with a method and URL"):
-            self.check(docs=new)
+            self.check_docs(new)
 
     def test_a_drop_in_portal_paths_with_a_known_method_is_refused(self):
         new = copy.deepcopy(self.portal)
@@ -607,13 +626,13 @@ class SnapshotCheckTests(unittest.TestCase):
         e["method"] = e["url"] = None
         with mock.patch.object(api_watch, "RESOLVED_DROP_LIMIT", 1.0):          # isolate this check from the count check
             with self.assertRaisesRegex(api_watch.WatchError, "lost the method or URL"):
-                self.check(docs=degraded, rsp={"/api/v1/things/list"})
-            self.check(docs=degraded)                                           # not a path the CLI calls
+                self.check_docs(degraded, rsp={"/api/v1/things/list"})
+            self.check_docs(degraded)                                           # not a path the CLI calls
             removed = copy.deepcopy(self.docs)
             removed["pages"][page]["endpoints"] = []
-            self.check(docs=removed, rsp={"/api/v1/things/list"})               # gone from the page: shown in the report
+            self.check_docs(removed, rsp={"/api/v1/things/list"})               # gone from the page: shown in the report
             del removed["pages"][page]
-            self.check(docs=removed, rsp={"/api/v1/things/list"})
+            self.check_docs(removed, rsp={"/api/v1/things/list"})
 
     def test_page_modules_of_unchanged_paths_are_kept(self):
         new = copy.deepcopy(self.portal)
@@ -642,7 +661,7 @@ class CommandTests(unittest.TestCase):
     def run_main(self, *argv, fetch=None):
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), small_limits(), \
-                mock.patch.object(api_watch, "Fetcher", lambda: fetch or FakeSite()):
+                mock.patch.object(api_watch, "Fetcher", lambda **kw: fetch or FakeSite()):
             code = api_watch.main(list(argv))
         return code, out.getvalue(), err.getvalue()
 
@@ -650,7 +669,8 @@ class CommandTests(unittest.TestCase):
         base, new = self.tmp / "base", self.tmp / "new"
         code, out, err = self.run_main("snapshot", "--out", str(base), "--baseline", str(self.tmp / "none"))
         self.assertEqual((code, err), (0, ""))
-        self.assertTrue((base / "docs.json").read_text().endswith("\n"))
+        self.assertTrue((base / "portal.json").read_text().endswith("\n"))
+        self.assertEqual([f.name for f in base.iterdir()], ["portal.json"])          # no documentation content
         self.assertIn("12 portal paths", out)
 
         def edit(name, text):                                         # the portal flips one GET to POST
@@ -705,7 +725,6 @@ class CommandTests(unittest.TestCase):
         code, out, err = self.run_main("snapshot", "--out", str(again), "--baseline", str(base))
         self.assertEqual(code, 0, err)
         self.assertEqual((again / "portal.json").read_text(), (base / "portal.json").read_text())
-        self.assertEqual((again / "docs.json").read_text(), (base / "docs.json").read_text())
         code, out, err = self.run_main("diff", "--old", str(base), "--new", str(again))
         self.assertIn("no changes", err)
 
@@ -741,8 +760,361 @@ class CommandTests(unittest.TestCase):
         self.assertFalse(new.exists())
 
 
+# ------------------------------------------------------------------ docs-check
+
+TOKEN = "SESSIONTOKEN-do-not-leak-0123456789"
+POSIX = os.name == "posix"
+ROOT_DIR = Path(__file__).resolve().parent.parent
+QUERY_ORDER = "/api/v1/plan/queryOrder"
+LIST_THINGS = "/rsp/api-reference/items/list-things.html"
+SIGN_IN = "sign in first: simlessly portal login"
+
+
+class _Response:
+    def __init__(self, body):
+        self.body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self, limit=None):
+        return self.body[:limit]
+
+
+class FakeOpener:
+    """Stands in for the urllib opener: serves the fixture site and keeps every Request."""
+
+    def __init__(self, site):
+        self.site = site
+        self.requests = []
+
+    def open(self, request, timeout=None):
+        self.requests.append(request)
+        if request.full_url not in self.site.pages:
+            raise urllib.error.HTTPError(request.full_url, 404, "Not Found", {}, None)
+        return _Response(self.site.pages[request.full_url].encode("utf-8"))
+
+
+class FetcherSessionTests(unittest.TestCase):
+    def fetch(self, url, token):
+        opener = FakeOpener(FakeSite())
+        fetcher = api_watch.Fetcher(delay=0, session_token=token)
+        fetcher._opener = opener
+        fetcher(url)
+        return opener.requests[0]
+
+    def test_the_session_is_sent_as_a_cookie_to_the_documentation_host_only(self):
+        request = self.fetch("https://docs.simlessly.com/", TOKEN)
+        self.assertEqual(request.get_header("Cookie"), "simlessly_token=" + TOKEN)
+        self.assertIsNone(self.fetch("https://rsp.simlessly.com/", TOKEN).get_header("Cookie"))
+        self.assertIsNone(self.fetch("https://docs.simlessly.com/", None).get_header("Cookie"))
+
+
+class DocsCheckTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="docs-check-test-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.portal = MockPortal()
+        self.addCleanup(self.portal.close)
+        self.fetched_before_session_check = []
+        self.session_answer = None            # None: valid session; else the failure envelope code
+        self.portal.routes[QUERY_ORDER] = self.session_route
+        self.site = FakeSite()
+        self.opener = FakeOpener(self.site)
+        self.snapshot = self.tmp / "private" / "docs-snapshot.json"
+        self.env = {"SIMLESSLY_PORTAL_TOKEN": TOKEN, "SIMLESSLY_BASE_URL": self.portal.url,
+                    "SIMLESSLY_NO_KEYCHAIN": "1", "SIMLESSLY_NO_CREDENTIALS_FILE": "1",
+                    "SIMLESSLY_DOCS_SNAPSHOT": str(self.snapshot)}
+
+    def session_route(self, rec):
+        self.fetched_before_session_check.append(len(self.opener.requests))
+        if self.session_answer:
+            return 200, envelope(None, False, "user token invalid, please login first", self.session_answer), {}
+        if rec.headers.get("Simlessly-Token") != TOKEN:
+            return 200, envelope(None, False, "user token invalid, please login first", "10206"), {}
+        return ok({"planType": "PRO", "status": "ACTIVE"})
+
+    def run_check(self, *argv, env=None, drop=()):
+        environment = dict(self.env if env is None else env)
+        for name in drop:
+            environment.pop(name, None)
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), small_limits(), \
+                mock.patch.dict(os.environ, environment), \
+                mock.patch.object(api_watch.time, "sleep"), \
+                mock.patch.object(api_watch.urllib.request, "build_opener", lambda *a: self.opener):
+            if "SIMLESSLY_PORTAL_TOKEN" not in environment:
+                os.environ.pop("SIMLESSLY_PORTAL_TOKEN", None)
+            code = api_watch.main(["docs-check", *argv])
+        return code, out.getvalue(), err.getvalue()
+
+    def assertNothingFetched(self):
+        self.assertEqual(self.opener.requests, [])
+
+    def assertNoToken(self, *texts):
+        for text in texts:
+            self.assertNotIn(TOKEN, text)
+
+    def snapshot_text(self):
+        return self.snapshot.read_text(encoding="utf-8")
+
+    # ---- the session gate
+
+    def test_no_stored_session_is_refused_before_anything_is_requested(self):
+        code, out, err = self.run_check("--update", drop=("SIMLESSLY_PORTAL_TOKEN",))
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn(SIGN_IN, err)
+        self.assertEqual(self.portal.requests, [])
+        self.assertNothingFetched()
+        self.assertFalse(self.snapshot.parent.exists())
+
+    def test_an_invalid_session_is_refused_and_no_documentation_is_fetched(self):
+        for code_in_answer in ("10206", "10103", "10102"):
+            self.session_answer = code_in_answer
+            code, out, err = self.run_check("--update")
+            self.assertEqual((code, out), (1, ""), code_in_answer)
+            self.assertIn(SIGN_IN, err)
+            self.assertNoToken(err)
+            self.assertNothingFetched()
+            self.assertFalse(self.snapshot.parent.exists())
+        self.assertEqual(len(self.portal.requests), 3)
+
+    def test_a_token_that_cannot_be_sent_as_a_cookie_is_refused_without_a_request(self):
+        for bad in ("abc;def", "abc def", 'abc"def', "tok\u00e9n"):
+            code, out, err = self.run_check("--update", env={**self.env, "SIMLESSLY_PORTAL_TOKEN": bad})
+            self.assertEqual(code, 1, bad)
+            self.assertIn(SIGN_IN, err)
+        self.assertEqual(self.portal.requests, [])
+        self.assertNothingFetched()
+
+    def test_a_failed_check_that_is_not_a_session_problem_does_not_ask_for_a_login(self):
+        self.session_answer = "50000"
+        code, out, err = self.run_check("--update")
+        self.assertEqual(code, 1)
+        self.assertIn("could not check the portal session", err)
+        self.assertNotIn("sign in first", err)
+        self.assertNothingFetched()
+
+    def test_the_session_is_checked_like_the_documentation_site_does_and_before_the_pages(self):
+        code, out, err = self.run_check("--update")
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(len(self.portal.requests), 1)
+        request = self.portal.requests[0]
+        self.assertEqual((request.method, request.path, request.body), ("POST", QUERY_ORDER, "{}"))
+        self.assertEqual(request.headers["Simlessly-Token"], TOKEN)
+        self.assertEqual(request.problems, [])
+        self.assertEqual(self.fetched_before_session_check, [0])             # no page was requested before the check
+        self.assertIn(QUERY_ORDER, api_watch._cli_modules()[3].READ_METHODS)   # reached through the CLI's read allowlist
+        self.assertEqual(api_watch._cli_modules()[3].READ_METHODS[QUERY_ORDER], "POST")
+
+    # ---- fetching
+
+    def test_the_documentation_is_fetched_with_the_session_cookie(self):
+        code, out, err = self.run_check("--update")
+        self.assertEqual(code, 0, err)
+        self.assertTrue(self.opener.requests)
+        for request in self.opener.requests:
+            self.assertTrue(request.full_url.startswith("https://docs.simlessly.com/"), request.full_url)
+            self.assertEqual(request.get_header("Cookie"), "simlessly_token=" + TOKEN)
+            self.assertEqual(request.get_method(), "GET")
+
+    # ---- the private snapshot
+
+    def test_the_snapshot_is_written_outside_the_repository_for_the_owner_only(self):
+        code, out, err = self.run_check("--update")
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"documentation snapshot written to {self.snapshot.resolve()}", out)
+        with small_limits():
+            expected = api_watch.collect_docs(FakeSite())
+        self.assertEqual(json.loads(self.snapshot_text()), expected)
+        if POSIX:
+            self.assertEqual(stat.S_IMODE(self.snapshot.stat().st_mode), 0o600)
+            self.assertEqual(stat.S_IMODE(self.snapshot.parent.stat().st_mode), 0o700)
+        self.assertEqual([f.name for f in self.snapshot.parent.iterdir()], ["docs-snapshot.json"])    # no temp file left
+        self.assertIsNone(api_watch.work_tree_of(self.snapshot))
+        self.assertNoToken(out, err, self.snapshot_text())
+
+    def test_every_new_directory_on_the_way_is_private(self):
+        deep = self.tmp / "a" / "b" / "docs-snapshot.json"
+        code, out, err = self.run_check("--update", env={**self.env, "SIMLESSLY_DOCS_SNAPSHOT": str(deep)})
+        self.assertEqual(code, 0, err)
+        if POSIX:
+            for directory in (deep.parent, deep.parent.parent):
+                self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o700, directory)
+            self.assertEqual(stat.S_IMODE(deep.stat().st_mode), 0o600)
+
+    def test_the_default_location_is_in_the_config_directory(self):
+        home = self.tmp / "home"
+        config = home / ".config" / "simlessly-cli"
+        config.mkdir(parents=True)
+        if POSIX:
+            config.chmod(0o755)
+        env = {**self.env, "HOME": str(home), "USERPROFILE": str(home)}
+        del env["SIMLESSLY_DOCS_SNAPSHOT"]
+        code, out, err = self.run_check("--update", env=env, drop=("XDG_CONFIG_HOME",))
+        self.assertEqual(code, 0, err)
+        self.assertTrue((config / "docs-snapshot.json").is_file())
+        if POSIX:
+            self.assertEqual(stat.S_IMODE(config.stat().st_mode), 0o700)           # the default directory is tightened
+            self.assertEqual(stat.S_IMODE((config / "docs-snapshot.json").stat().st_mode), 0o600)
+        # $XDG_CONFIG_HOME moves it, as it moves the credentials file
+        xdg = self.tmp / "xdg"
+        code, out, err = self.run_check("--update", env={**env, "XDG_CONFIG_HOME": str(xdg)})
+        self.assertEqual(code, 0, err)
+        self.assertTrue((xdg / "simlessly-cli" / "docs-snapshot.json").is_file())
+
+    @unittest.skipUnless(POSIX, "directory modes")
+    def test_a_directory_chosen_by_the_user_is_not_changed_only_reported(self):
+        shared = self.tmp / "shared"
+        shared.mkdir()
+        shared.chmod(0o755)
+        code, out, err = self.run_check("--update", env={**self.env, "SIMLESSLY_DOCS_SNAPSHOT": str(shared / "d.json")})
+        self.assertEqual(code, 0)
+        self.assertEqual(stat.S_IMODE(shared.stat().st_mode), 0o755)
+        self.assertIn("can be read by other users", err)
+
+    def test_a_path_inside_the_repository_or_any_git_work_tree_is_refused(self):
+        other_tree = self.tmp / "other"
+        (other_tree / ".git").mkdir(parents=True)
+        link = self.tmp / "link"
+        try:
+            link.symlink_to(ROOT_DIR, target_is_directory=True)
+            linked = [link / "docs-snapshot.json"]
+        except (OSError, NotImplementedError):
+            linked = []
+        for path in (ROOT_DIR / "docs-snapshot.json", ROOT_DIR / "api-snapshot" / "docs.json",
+                     ROOT_DIR / "new-dir" / "d.json", other_tree / "sub" / "d.json", *linked):
+            code, out, err = self.run_check("--update", env={**self.env, "SIMLESSLY_DOCS_SNAPSHOT": str(path)})
+            self.assertEqual((code, out), (1, ""), path)
+            self.assertIn("inside the git work tree", err)
+            self.assertFalse(path.exists(), path)
+        self.assertFalse((other_tree / "sub").exists())
+        self.assertFalse((ROOT_DIR / "new-dir").exists())
+        self.assertEqual(self.portal.requests, [])                              # refused before the session was used
+        self.assertNothingFetched()
+
+    def test_a_report_file_inside_a_work_tree_is_refused(self):
+        self.run_check("--update")
+        other_tree = self.tmp / "other"
+        (other_tree / ".git").mkdir(parents=True)
+        for path in (ROOT_DIR / "report.md", other_tree / "report.md"):
+            code, out, err = self.run_check("--report", str(path))
+            self.assertEqual(code, 1)
+            self.assertIn("refusing to write the report", err)
+            self.assertFalse(path.exists())
+
+    # ---- update and report
+
+    def test_report_and_update_exit_codes(self):
+        code, out, err = self.run_check()                                       # nothing stored yet
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("no documentation snapshot", err)
+        self.assertIn("docs-check --update", err)
+
+        code, out, err = self.run_check("--update")
+        self.assertEqual(code, 0, err)
+        code, out, err = self.run_check()
+        self.assertEqual(code, 0, err)
+        self.assertIn("No changes since the stored snapshot.", out)
+        self.assertIn("no changes", err)
+
+        stored = json.loads(self.snapshot_text())                               # the documentation moved on since then
+        stored["pages"][LIST_THINGS]["endpoints"][0]["request"][0]["type"] = "Text"
+        self.snapshot.write_text(api_watch.dump_json(stored), encoding="utf-8")
+        before = self.snapshot_text()
+        code, out, err = self.run_check()
+        self.assertEqual(code, 1, err)
+        self.assertIn("# Documentation change report", out)
+        self.assertIn("request: field `nameFilter` changed from `nameFilter (Text, optional)` to `nameFilter (String, optional)`", out)
+        self.assertIn("documentation differs from the stored snapshot", err)
+        self.assertEqual(self.snapshot_text(), before)                          # a report never rewrites the snapshot
+
+        code, out, err = self.run_check("--update")
+        self.assertEqual(code, 0, err)
+        self.assertIn("1 changed", out)
+        self.assertNotEqual(self.snapshot_text(), before)
+        self.assertEqual(self.run_check()[0], 0)
+
+    def test_the_report_can_go_to_a_file_outside_the_repository(self):
+        self.run_check("--update")
+        stored = json.loads(self.snapshot_text())
+        stored["pages"][LIST_THINGS]["endpoints"][0]["request"][0]["type"] = "Text"
+        self.snapshot.write_text(api_watch.dump_json(stored), encoding="utf-8")
+        report = self.tmp / "report.md"
+        code, out, err = self.run_check("--report", str(report))
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("changed from", report.read_text(encoding="utf-8"))
+        if POSIX:
+            self.assertEqual(stat.S_IMODE(report.stat().st_mode), 0o600)
+        self.assertNoToken(report.read_text(encoding="utf-8"), err)
+
+    def test_update_and_report_cannot_be_combined(self):
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            api_watch.main(["docs-check", "--update", "--report", "x.md"])
+
+    def test_a_degraded_reading_is_not_used_unless_forced(self):
+        self.run_check("--update")
+        stored = json.loads(self.snapshot_text())
+        extra = [{**copy.deepcopy(stored["pages"][LIST_THINGS]["endpoints"][0]), "url": f"https://rsp.example.test/api/v1/x/{i}",
+                  "title": f"X{i}"} for i in range(40)]
+        stored["pages"]["/rsp/api-reference/items/extra.html"] = {"title": "Extra", "endpoints": extra}
+        self.snapshot.write_text(api_watch.dump_json(stored), encoding="utf-8")
+        before = self.snapshot_text()
+        for argv in ((), ("--update",)):
+            code, out, err = self.run_check(*argv)
+            self.assertEqual(code, 1, argv)
+            self.assertIn("refusing to use it", err)
+            self.assertEqual(self.snapshot_text(), before)
+        code, out, err = self.run_check("--update", "--force")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("extra.html", self.snapshot_text())
+
+    def test_an_unreadable_stored_snapshot_is_reported_and_can_be_replaced_with_force(self):
+        self.snapshot.parent.mkdir(mode=0o700)
+        for content in ("{", '{"schema": 1, "pages": []}'):
+            self.snapshot.write_text(content, encoding="utf-8")
+            code, out, err = self.run_check()
+            self.assertEqual(code, 1, content)
+            self.assertIn("Delete it, or run docs-check --update --force", err)
+        self.snapshot.write_text(api_watch.dump_json({"schema": 1, "pages": {"/x": {}}, "unavailable": []}), encoding="utf-8")
+        code, out, err = self.run_check()
+        self.assertEqual(code, 1)
+        self.assertIn("unexpected structure", err)
+        code, out, err = self.run_check("--update", "--force")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.run_check()[0], 0)
+
+    def test_a_failed_page_fetch_is_an_error_not_a_change_and_the_snapshot_is_kept(self):
+        self.run_check("--update")
+        before = self.snapshot_text()
+        self.site.pages.pop("https://docs.simlessly.com/")
+        code, out, err = self.run_check()
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("api_watch: error:", err)
+        self.assertEqual(self.snapshot_text(), before)
+
+    def test_the_token_is_never_printed_or_stored(self):
+        outputs = []
+        self.session_answer = "10206"
+        outputs += self.run_check("--update")[1:]
+        self.session_answer = None
+        outputs += self.run_check("--update")[1:]
+        outputs += self.run_check()[1:]
+        self.site.pages.pop("https://docs.simlessly.com/")
+        outputs += self.run_check()[1:]
+        self.assertNoToken(*outputs, self.snapshot_text())
+        for request in self.opener.requests:                                    # only the cookie carries it
+            self.assertNotIn(TOKEN, request.full_url)
+            self.assertEqual([k for k, v in request.header_items() if TOKEN in v], ["Cookie"])
+
+
 class RepositoryDataTests(unittest.TestCase):
     """The committed snapshot and the CLI's endpoint data."""
+
+    ROOT = Path(__file__).resolve().parent.parent
 
     def test_the_cli_endpoint_file_is_what_apply_edits(self):
         groups = api_watch.load_endpoint_groups(ENDPOINTS_FILE)
@@ -751,15 +1123,16 @@ class RepositoryDataTests(unittest.TestCase):
         self.assertEqual(len(paths), sum(len(groups[g]) for g in ("session", "read", "write")))     # no path in two groups
 
     def test_the_committed_snapshot_has_every_cli_path_with_a_compatible_transport(self):
-        snapshot = Path(__file__).resolve().parent.parent / "api-snapshot"
-        docs, portal = api_watch.load_snapshot(snapshot)
+        portal = api_watch.load_snapshot(self.ROOT / "api-snapshot")
         groups = api_watch.load_endpoint_groups(ENDPOINTS_FILE)
         plan = api_watch.plan_apply(groups, portal)
         self.assertEqual(plan, {"applied": [], "skipped": [], "missing": []})
-        self.assertGreater(api_watch.count_docs(docs), 10)
-        rsp = api_watch.cli_rsp_paths()
-        documented = {api_watch._url_path(e["url"]) for e in api_watch._docs_endpoints(docs).values()}
-        self.assertEqual(rsp - documented, set(), "documented RSP paths used by the CLI")
+
+    def test_no_documentation_content_is_in_the_repository(self):
+        self.assertEqual(sorted(f.name for f in (self.ROOT / "api-snapshot").iterdir()), ["portal.json"])
+        ignored = (self.ROOT / ".gitignore").read_text(encoding="utf-8").split()
+        self.assertIn("docs-snapshot.json", ignored)
+        self.assertIn("api-snapshot/docs.json", ignored)
 
 
 class WorkflowTests(unittest.TestCase):
@@ -786,6 +1159,18 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("gh pr ready --undo", self.TEXT)
         self.assertIn("gh pr close", self.TEXT)
         self.assertIn("gh pr create --draft", self.TEXT)
+
+    def test_the_workflow_covers_the_portal_only(self):
+        for word in ("docs.json", "docs-check", "docs-snapshot"):
+            self.assertNotIn(word, self.TEXT)
+        self.assertNotIn("docs.simlessly.com", self.TEXT)
+        self.assertIn("api-new/portal.json", self.TEXT)
+
+    def test_no_expression_is_expanded_inside_a_run_script(self):
+        for step in self.TEXT.split("      - name: ")[1:]:
+            if "run:" in step:
+                script = step.split("run:", 1)[1]
+                self.assertNotIn("${{", script)
 
     def test_actions_are_pinned_to_a_commit(self):
         import re
