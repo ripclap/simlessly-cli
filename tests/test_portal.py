@@ -720,27 +720,10 @@ class LogsTests(PortalCase):
 # ------------------------------------------------------------------ allowlist
 
 class AllowlistTests(PortalCase):
-    SESSION = {"/api/v1/user/login": "POST", "/api/v1/user/logout": "GET"}
-    READ = {
-        "/api/v1/fleet/list": "POST", "/api/v1/fleet/recycle/query": "POST", "/api/v1/fleet/transaction": "POST",
-        "/api/v1/fleet/qrcode": "POST", "/api/v1/log/profile/list": "POST", "/api/v1/log/profile/detail": "GET",
-        "/api/v1/log/batch-task/list": "POST", "/api/v1/log/recycle/list": "POST",
-        "/api/v1/config/name/query": "GET", "/api/v1/config/query": "POST", "/api/v1/config/detail": "GET",
-        "/api/v1/group/list": "POST", "/api/v1/campaign/list": "GET", "/api/v1/campaign/resource/list": "POST",
-        "/api/v1/block/list": "POST", "/api/v1/event/profile/query": "GET",
-        "/api/v1/analytic/percentage": "GET", "/api/v1/analytic/deviceBrand": "GET",
-        "/api/v1/analytic/profileStatus": "GET", "/api/v1/analytic/downloadByDay": "POST",
-        "/api/v1/analytic/downloadByMonth": "POST", "/api/v1/analytic/redownload": "POST",
-        "/api/v1/analytic/ac-count": "GET", "/api/v1/analytic/latest-week": "GET",
-        "/api/v1/report/config/query": "POST", "/api/v1/plan/queryOrder": "POST", "/api/v1/plan/list": "POST",
-        "/api/v1/order/list": "POST", "/api/v1/order/detail": "POST", "/api/v1/enterprise/info": "GET",
-        "/api/v1/enterprise/list": "GET", "/api/v1/enum/list": "POST",
-    }
-    WRITE = {
-        "/api/v1/fleet/delete": "POST", "/api/v1/fleet/update-notes": "POST", "/api/v1/fleet/re-generate": "POST",
-        "/api/v1/fleet/recycle": "POST", "/api/v1/fleet/generateAc": "POST", "/api/v1/group/add": "POST",
-        "/api/v1/group/batchGroup": "POST",
-    }
+    # path -> method, the methods from the last observed portal (see support.PORTAL_*_PATHS)
+    SESSION = {p: support.OBSERVED_PORTAL_METHODS[p] for p in support.PORTAL_SESSION_PATHS}
+    READ = {p: support.OBSERVED_PORTAL_METHODS[p] for p in support.PORTAL_READ_PATHS}
+    WRITE = {p: support.OBSERVED_PORTAL_METHODS[p] for p in support.PORTAL_WRITE_PATHS}
     # on the website but not implemented (billing, other people's access, secrets, operator calls)
     NOT_IMPLEMENTED = ["/api/v1/order/create", "/api/v1/order/paid", "/api/v1/order/cancel", "/api/v1/plan/cancelSubscription",
                        "/api/v1/enterprise/add", "/api/v1/enterprise/switch", "/api/v1/developer/keys",
@@ -757,6 +740,14 @@ class AllowlistTests(PortalCase):
         self.assertEqual(PORTAL_PATHS, frozenset({*self.SESSION, *self.READ, *self.WRITE}))
         self.assertEqual(portal.READ_PATHS, frozenset(self.READ))
         self.assertEqual(portal.WRITE_PATHS, frozenset(self.WRITE))
+
+    def test_methods_and_transports_match_the_last_observed_portal(self):
+        for path in support.PORTAL_ALLOWED_PATHS:
+            seen = support.OBSERVED_PORTAL.get(path)
+            self.assertIsNotNone(seen, f"{path} is not in api-snapshot/portal.json")
+            self.assertEqual(portal.PORTAL_METHODS[path], seen["method"], path)
+            expected = "multipart" if path in portal.MULTIPART_PATHS else ("query" if seen["method"] == "GET" else "json")
+            self.assertEqual(seen["transport"], expected, path)
 
     def test_fixed_method_per_path(self):
         self.assertEqual(dict(portal.SESSION_METHODS), self.SESSION)
@@ -877,6 +868,56 @@ class AllowlistTests(PortalCase):
         for word in ("destroy", "block-add", "order-create", "switch"):
             code, out, err = self.run_cli("portal", word)
             self.assertEqual(code, 2)                                # not a command
+
+
+class EndpointDataTests(unittest.TestCase):
+    """portal_endpoints.json is loaded fail-closed: anything irregular stops the import."""
+
+    GOOD = {"session": {portal.PATH_LOGIN: "POST"}, "read": {"/api/v1/a/get": "GET"},
+            "write": {"/api/v1/a/put": "POST"}, "multipart": ["/api/v1/a/put"]}
+
+    def load(self, data):
+        return portal._load_endpoints(data if isinstance(data, str) else json.dumps(data))
+
+    def test_good_data_loads(self):
+        groups, multipart = self.load(self.GOOD)
+        self.assertEqual(groups["read"], {"/api/v1/a/get": "GET"})
+        self.assertEqual(multipart, frozenset({"/api/v1/a/put"}))
+
+    def test_the_packaged_file_is_loaded_and_is_json_next_to_the_module(self):
+        path = Path(portal.__file__).with_name("portal_endpoints.json")
+        groups, multipart = self.load(path.read_text(encoding="utf-8"))
+        self.assertEqual(groups["read"], dict(portal.READ_METHODS))
+        self.assertEqual(multipart, portal.MULTIPART_PATHS)
+
+    def test_irregular_data_is_refused(self):
+        def bad(**change):
+            data = json.loads(json.dumps(self.GOOD))
+            data.update(change)
+            return data
+        cases = {
+            "not json": "{",
+            "a list": "[]",
+            "missing group": {k: v for k, v in self.GOOD.items() if k != "write"},
+            "extra key": bad(extra={}),
+            "empty group": bad(read={}),
+            "unknown method": bad(read={"/api/v1/a/get": "PUT"}),
+            "lower-case method": bad(read={"/api/v1/a/get": "get"}),
+            "path outside /api/vN/": bad(read={"/other/get": "GET"}),
+            "path with a query": bad(read={"/api/v1/a/get?x=1": "GET"}),
+            "path with a dot segment": bad(read={"/api/v1/a/../get": "GET"}),
+            "same path in two groups": bad(read={"/api/v1/a/put": "POST"}),
+            "multipart path not in write": bad(multipart=["/api/v1/a/get"]),
+            "multipart path that is a GET": bad(write={"/api/v1/a/put": "GET"}),
+            "write path that is a GET": bad(write={"/api/v1/a/put": "POST", "/api/v1/a/del": "GET"}),
+            "login as GET": bad(session={portal.PATH_LOGIN: "GET"}),
+            "login missing from the session group": bad(session={"/api/v1/a/logout": "GET"}),
+            "login in the read group": bad(session={"/api/v1/a/logout": "GET"}, read={portal.PATH_LOGIN: "POST"}),
+            "multipart not a list": bad(multipart="/api/v1/a/put"),
+        }
+        for label, data in cases.items():
+            with self.assertRaises(RuntimeError, msg=label):
+                self.load(data)
 
 
 class ConfigIntegrationTests(PortalCase):

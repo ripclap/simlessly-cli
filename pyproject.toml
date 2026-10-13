@@ -34,3 +34,6 @@ simlessly = "simlessly_cli.cli:main_entry"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+simlessly_cli = ["portal_endpoints.json"]

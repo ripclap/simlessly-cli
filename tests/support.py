@@ -225,6 +225,39 @@ class CliTestCase(unittest.TestCase):
             self.assertEqual(rec.problems, [], rec.path)
 
 
+# ---- the portal allowlist, restated by hand -------------------------------------------------
+# Which paths the CLI may call, per group. No methods here: the HTTP methods the mock enforces come from
+# api-snapshot/portal.json, which tools/api_watch.py writes from the live portal's front-end. So a wrong method in
+# src/simlessly_cli/portal_endpoints.json fails the tests, and `api_watch.py apply` (which edits only that file and
+# the snapshot together) keeps them in step. Adding a path or moving it between groups means editing this list.
+PORTAL_SESSION_PATHS = ("/api/v1/user/login", "/api/v1/user/logout")
+PORTAL_READ_PATHS = (
+    "/api/v1/fleet/list", "/api/v1/fleet/recycle/query", "/api/v1/fleet/transaction", "/api/v1/fleet/qrcode",
+    "/api/v1/log/profile/list", "/api/v1/log/profile/detail", "/api/v1/log/batch-task/list", "/api/v1/log/recycle/list",
+    "/api/v1/config/name/query", "/api/v1/config/query", "/api/v1/config/detail", "/api/v1/group/list",
+    "/api/v1/campaign/list", "/api/v1/campaign/resource/list", "/api/v1/block/list", "/api/v1/event/profile/query",
+    "/api/v1/analytic/percentage", "/api/v1/analytic/deviceBrand", "/api/v1/analytic/profileStatus",
+    "/api/v1/analytic/downloadByDay", "/api/v1/analytic/downloadByMonth", "/api/v1/analytic/redownload",
+    "/api/v1/analytic/ac-count", "/api/v1/analytic/latest-week", "/api/v1/report/config/query",
+    "/api/v1/plan/queryOrder", "/api/v1/plan/list", "/api/v1/order/list", "/api/v1/order/detail",
+    "/api/v1/enterprise/info", "/api/v1/enterprise/list", "/api/v1/enum/list",
+)
+PORTAL_WRITE_PATHS = (
+    "/api/v1/fleet/delete", "/api/v1/fleet/update-notes", "/api/v1/fleet/re-generate", "/api/v1/fleet/recycle",
+    "/api/v1/fleet/generateAc", "/api/v1/group/add", "/api/v1/group/batchGroup",
+)
+PORTAL_ALLOWED_PATHS = PORTAL_SESSION_PATHS + PORTAL_READ_PATHS + PORTAL_WRITE_PATHS
+SNAPSHOT_DIR = Path(__file__).resolve().parent.parent / "api-snapshot"
+
+
+def _observed_portal() -> dict:
+    return json.loads((SNAPSHOT_DIR / "portal.json").read_text(encoding="utf-8"))["endpoints"]
+
+
+OBSERVED_PORTAL = _observed_portal()
+OBSERVED_PORTAL_METHODS = {p: OBSERVED_PORTAL.get(p, {}).get("method", "NOT IN SNAPSHOT") for p in PORTAL_ALLOWED_PATHS}
+
+
 class MockPortal(MockSimlessly):
     """A local stand-in for the portal's session API: a session token, no signature.
 
@@ -233,29 +266,8 @@ class MockPortal(MockSimlessly):
     Each route decides whether the token is acceptable (the real portal answers HTTP 200 with code 10102).
     """
 
-    # Defined separately from simlessly_cli.portal: the HTTP method per path.
-    METHODS = {
-        # session
-        "/api/v1/user/login": "POST", "/api/v1/user/logout": "GET",
-        # read-only
-        "/api/v1/fleet/list": "POST", "/api/v1/fleet/recycle/query": "POST", "/api/v1/fleet/transaction": "POST",
-        "/api/v1/fleet/qrcode": "POST", "/api/v1/log/profile/list": "POST", "/api/v1/log/profile/detail": "GET",
-        "/api/v1/log/batch-task/list": "POST", "/api/v1/log/recycle/list": "POST",
-        "/api/v1/config/name/query": "GET", "/api/v1/config/query": "POST", "/api/v1/config/detail": "GET",
-        "/api/v1/group/list": "POST", "/api/v1/campaign/list": "GET", "/api/v1/campaign/resource/list": "POST",
-        "/api/v1/block/list": "POST", "/api/v1/event/profile/query": "GET",
-        "/api/v1/analytic/percentage": "GET", "/api/v1/analytic/deviceBrand": "GET",
-        "/api/v1/analytic/profileStatus": "GET", "/api/v1/analytic/downloadByDay": "POST",
-        "/api/v1/analytic/downloadByMonth": "POST", "/api/v1/analytic/redownload": "POST",
-        "/api/v1/analytic/ac-count": "GET", "/api/v1/analytic/latest-week": "GET",
-        "/api/v1/report/config/query": "POST", "/api/v1/plan/queryOrder": "POST", "/api/v1/plan/list": "POST",
-        "/api/v1/order/list": "POST", "/api/v1/order/detail": "POST", "/api/v1/enterprise/info": "GET",
-        "/api/v1/enterprise/list": "GET", "/api/v1/enum/list": "POST",
-        # state-changing
-        "/api/v1/fleet/delete": "POST", "/api/v1/fleet/update-notes": "POST", "/api/v1/fleet/re-generate": "POST",
-        "/api/v1/fleet/recycle": "POST", "/api/v1/fleet/generateAc": "POST", "/api/v1/group/add": "POST",
-        "/api/v1/group/batchGroup": "POST",
-    }
+    # The HTTP method per path as last observed on the live portal (api-snapshot/portal.json), not the CLI's own data.
+    METHODS = dict(OBSERVED_PORTAL_METHODS)
 
     def verify(self, rec: Record) -> list[str]:
         h, problems = rec.headers, []

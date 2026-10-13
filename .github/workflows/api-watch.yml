@@ -1,0 +1,165 @@
+name: API change watch
+
+# Once a week, read the public Simlessly documentation and the web portal's front-end files, compare them with
+# api-snapshot/, update the HTTP method of read-group portal paths the CLI already uses, and open one pull request
+# with the result. Only static pages are fetched; no /api/ endpoint is called. See "API change watch" in the README.
+#
+# The write token is not stored in the git configuration. Only the last steps receive it, after the pages have
+# been parsed and the tests have run.
+
+on:
+  schedule:
+    - cron: "0 14 * * 1"    # Mondays, 14:00 UTC
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: api-watch
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      BASE_BRANCH: main
+      WATCH_BRANCH: api-watch/update
+      BOT_EMAIL: 41898282+github-actions[bot]@users.noreply.github.com
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.13"
+
+      - name: Fetch the current documentation and portal data
+        run: python tools/api_watch.py snapshot --out "$RUNNER_TEMP/api-new"
+
+      - name: Compare with the committed snapshot
+        run: python tools/api_watch.py diff --new "$RUNNER_TEMP/api-new" --report "$RUNNER_TEMP/report.md"
+
+      - name: Update portal methods and install the new snapshot
+        run: |
+          python tools/api_watch.py apply --new "$RUNNER_TEMP/api-new" --report "$RUNNER_TEMP/report.md"
+          cp "$RUNNER_TEMP/api-new/docs.json" "$RUNNER_TEMP/api-new/portal.json" api-snapshot/
+
+      - name: Check for changes
+        id: changes
+        run: |
+          if [ -n "$(git status --porcelain -- api-snapshot src/simlessly_cli/portal_endpoints.json)" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No API changes."
+          fi
+
+      - name: Run the unit tests
+        id: tests
+        if: steps.changes.outputs.changed == 'true'
+        continue-on-error: true
+        run: python -m unittest discover -s tests
+
+      - name: Open or update the pull request
+        if: steps.changes.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TESTS_OUTCOME: ${{ steps.tests.outcome }}
+        run: |
+          set -eu
+          gh auth setup-git
+          title="Update API snapshot"
+          git config user.name "github-actions[bot]"
+          git config user.email "$BOT_EMAIL"
+
+          # Does the pull request branch hold commits by a person? The bot never overwrites those.
+          remote_sha=""
+          hand_edited=false
+          if git ls-remote --exit-code --heads origin "$WATCH_BRANCH" > /dev/null 2>&1; then
+            git fetch --no-tags origin "+refs/heads/$WATCH_BRANCH:refs/remotes/origin/$WATCH_BRANCH"
+            remote_sha="$(git rev-parse "refs/remotes/origin/$WATCH_BRANCH")"
+            if [ -n "$(git log --format='%ae' "origin/$BASE_BRANCH..origin/$WATCH_BRANCH" | grep -vxF "$BOT_EMAIL" || true)" ]; then
+              hand_edited=true
+            fi
+          fi
+
+          {
+            if [ "$hand_edited" = "true" ]; then
+              echo "**The branch has commits by a person, so it was not updated.** The report below describes the latest check, not the branch."
+              echo
+            fi
+            if [ "$TESTS_OUTCOME" = "success" ]; then
+              echo "Unit tests passed."
+            else
+              echo "**Unit tests failed after these changes.** See the workflow run for the output."
+            fi
+            echo
+            cat "$RUNNER_TEMP/report.md"
+            echo
+            echo "---"
+            echo "Opened by the weekly API change watch (.github/workflows/api-watch.yml). Review the changes before merging."
+          } > "$RUNNER_TEMP/body.md"
+
+          git checkout -B "$WATCH_BRANCH"
+          git add -- api-snapshot src/simlessly_cli/portal_endpoints.json
+          git commit -m "$title"
+
+          if [ "$hand_edited" = "true" ]; then
+            echo "Not pushing: $WATCH_BRANCH has commits by a person."
+          elif [ -n "$remote_sha" ] && git diff --quiet "origin/$WATCH_BRANCH" HEAD; then
+            echo "$WATCH_BRANCH already has this content."
+          else
+            # With an empty expected value the lease requires that the branch does not exist yet.
+            git push --force-with-lease="$WATCH_BRANCH:$remote_sha" origin "$WATCH_BRANCH"
+          fi
+
+          number="$(gh pr list --head "$WATCH_BRANCH" --base "$BASE_BRANCH" --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$number" ]; then
+            gh pr edit "$number" --title "$title" --body-file "$RUNNER_TEMP/body.md"
+            if [ "$hand_edited" = "true" ]; then
+              :
+            elif [ "$TESTS_OUTCOME" = "success" ]; then
+              gh pr ready "$number" || true
+            else
+              gh pr ready --undo "$number" || true
+            fi
+          elif [ "$hand_edited" = "true" ]; then
+            echo "::warning::$WATCH_BRANCH has commits by a person and no open pull request. Nothing was changed."
+          elif [ "$TESTS_OUTCOME" = "success" ]; then
+            gh pr create --base "$BASE_BRANCH" --head "$WATCH_BRANCH" --title "$title" --body-file "$RUNNER_TEMP/body.md"
+          else
+            gh pr create --draft --base "$BASE_BRANCH" --head "$WATCH_BRANCH" --title "$title" --body-file "$RUNNER_TEMP/body.md"
+          fi
+
+      - name: Close an outdated pull request
+        if: steps.changes.outputs.changed == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          number="$(gh pr list --head "$WATCH_BRANCH" --base "$BASE_BRANCH" --state open --json number --jq '.[0].number // empty')"
+          if [ -z "$number" ]; then
+            exit 0
+          fi
+          if [ -n "$(git log --format='%ae' "origin/$BASE_BRANCH..origin/$WATCH_BRANCH" | grep -vxF "$BOT_EMAIL" || true)" ]; then
+            echo "::notice::Pull request #$number is outdated but its branch has commits by a person, so it was left open."
+            exit 0
+          fi
+          gh auth setup-git
+          gh pr close "$number" --delete-branch \
+            --comment "The documentation and portal now match the snapshot on $BASE_BRANCH, so this pull request is no longer needed."
+
+      - name: Fail the run if the tests failed
+        if: steps.changes.outputs.changed == 'true' && steps.tests.outcome != 'success'
+        run: |
+          echo "The unit tests failed after the update. The pull request was opened or updated as a draft with the report."
+          exit 1

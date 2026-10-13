@@ -5,7 +5,7 @@ Differences from client.py:
 * Authentication is a session token (`Simlessly-Token`), not an HMAC signature. The token grants
   the same access as the login, so it is stored like the API keys and never printed.
 * Three fixed maps of path to HTTP method: SESSION_METHODS (login, logout), READ_METHODS and
-  WRITE_METHODS. The caller never chooses the method. A GET sends a query string and no body. The
+  WRITE_METHODS, loaded from portal_endpoints.json. The caller never chooses the method. A GET sends a query string and no body. The
   portal answers a wrong method with HTTP 200 and code 10008.
 * One entry point per kind of call, each refusing paths from the other maps before any network I/O:
   `read()` cannot reach a state-changing path, and `write()` / `write_multipart()` are used only
@@ -19,8 +19,10 @@ Differences from client.py:
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
+from importlib import resources
 from types import MappingProxyType
 from typing import Any, Callable, Mapping
 from urllib.parse import urlencode
@@ -75,57 +77,56 @@ PATH_FLEET_GENERATE_AC = "/api/v1/fleet/generateAc"   # multipart/form-data (wri
 PATH_GROUP_ADD = "/api/v1/group/add"
 PATH_GROUP_BATCH = "/api/v1/group/batchGroup"
 
-# The only portal paths the client calls.
+# The only portal paths the client calls, with the HTTP method of each. The data lives in
+# portal_endpoints.json (groups: session, read, write; plus the list of multipart upload paths) so that
+# tools/api_watch.py can update a method when the portal changes it. A path that is in no group is refused.
 METHOD_POST, METHOD_GET = "POST", "GET"
-SESSION_METHODS: Mapping[str, str] = MappingProxyType({
-    PATH_LOGIN: METHOD_POST,
-    PATH_LOGOUT: METHOD_GET,
-})
-READ_METHODS: Mapping[str, str] = MappingProxyType({
-    PATH_FLEET_LIST: METHOD_POST,
-    PATH_FLEET_RECYCLE_QUERY: METHOD_POST,
-    PATH_FLEET_TRANSACTION: METHOD_POST,
-    PATH_FLEET_QRCODE: METHOD_POST,
-    PATH_LOG_PROFILE_LIST: METHOD_POST,
-    PATH_LOG_PROFILE_DETAIL: METHOD_GET,
-    PATH_LOG_BATCH_TASK_LIST: METHOD_POST,
-    PATH_LOG_RECYCLE_LIST: METHOD_POST,
-    PATH_CONFIG_NAME_QUERY: METHOD_GET,
-    PATH_CONFIG_QUERY: METHOD_POST,
-    PATH_CONFIG_DETAIL: METHOD_GET,
-    PATH_GROUP_LIST: METHOD_POST,
-    PATH_CAMPAIGN_LIST: METHOD_GET,
-    PATH_CAMPAIGN_RESOURCE_LIST: METHOD_POST,
-    PATH_BLOCK_LIST: METHOD_POST,
-    PATH_EVENT_PROFILE_QUERY: METHOD_GET,
-    PATH_ANALYTIC_PERCENTAGE: METHOD_GET,
-    PATH_ANALYTIC_DEVICE_BRAND: METHOD_GET,
-    PATH_ANALYTIC_PROFILE_STATUS: METHOD_GET,
-    PATH_ANALYTIC_DOWNLOAD_BY_DAY: METHOD_POST,
-    PATH_ANALYTIC_DOWNLOAD_BY_MONTH: METHOD_POST,
-    PATH_ANALYTIC_REDOWNLOAD: METHOD_POST,
-    PATH_ANALYTIC_AC_COUNT: METHOD_GET,
-    PATH_ANALYTIC_LATEST_WEEK: METHOD_GET,
-    PATH_REPORT_CONFIG_QUERY: METHOD_POST,
-    PATH_PLAN_QUERY_ORDER: METHOD_POST,
-    PATH_PLAN_LIST: METHOD_POST,
-    PATH_ORDER_LIST: METHOD_POST,
-    PATH_ORDER_DETAIL: METHOD_POST,
-    PATH_ENTERPRISE_INFO: METHOD_GET,
-    PATH_ENTERPRISE_LIST: METHOD_GET,
-    PATH_ENUM_LIST: METHOD_POST,
-})
-WRITE_METHODS: Mapping[str, str] = MappingProxyType({
-    PATH_FLEET_DELETE: METHOD_POST,
-    PATH_FLEET_UPDATE_NOTES: METHOD_POST,
-    PATH_FLEET_RE_GENERATE: METHOD_POST,
-    PATH_FLEET_RECYCLE: METHOD_POST,
-    PATH_FLEET_GENERATE_AC: METHOD_POST,
-    PATH_GROUP_ADD: METHOD_POST,
-    PATH_GROUP_BATCH: METHOD_POST,
-})
+ENDPOINTS_RESOURCE = "portal_endpoints.json"
+_GROUPS = ("session", "read", "write")
+
+
+def _load_endpoints(text: str) -> tuple[dict[str, dict[str, str]], frozenset[str]]:
+    """Parse and check the endpoint data. Raises RuntimeError on any irregularity (fail closed at import)."""
+    try:
+        data = json.loads(text)
+    except ValueError as err:
+        raise RuntimeError(f"{ENDPOINTS_RESOURCE} is not valid JSON: {err}") from None
+    if not isinstance(data, dict) or set(data) != {*_GROUPS, "multipart"}:
+        raise RuntimeError(f"{ENDPOINTS_RESOURCE} must hold exactly the keys {', '.join((*_GROUPS, 'multipart'))}")
+    seen: set[str] = set()
+    groups: dict[str, dict[str, str]] = {}
+    for name in _GROUPS:
+        group = data[name]
+        if not isinstance(group, dict) or not group:
+            raise RuntimeError(f"{ENDPOINTS_RESOURCE}: group {name!r} must be a non-empty object")
+        for path, method in group.items():
+            if not (isinstance(path, str) and re.fullmatch(r"/api/v\d+/[A-Za-z0-9_\-]+(?:/[A-Za-z0-9_\-]+)*", path)):
+                raise RuntimeError(f"{ENDPOINTS_RESOURCE}: bad path {path!r}")
+            if method not in (METHOD_GET, METHOD_POST):
+                raise RuntimeError(f"{ENDPOINTS_RESOURCE}: bad method {method!r} for {path}")
+            if path in seen:
+                raise RuntimeError(f"{ENDPOINTS_RESOURCE}: {path} is listed in more than one group")
+            if name == "write" and method != METHOD_POST:
+                raise RuntimeError(f"{ENDPOINTS_RESOURCE}: {path} is in the write group and must be POST")
+            seen.add(path)
+        groups[name] = dict(group)
+    if groups["session"].get(PATH_LOGIN) != METHOD_POST:        # a GET would put the credentials in the URL
+        raise RuntimeError(f"{ENDPOINTS_RESOURCE}: {PATH_LOGIN} must be in the session group as POST")
+    multipart = data["multipart"]
+    if not isinstance(multipart, list) or not all(isinstance(p, str) for p in multipart):
+        raise RuntimeError(f"{ENDPOINTS_RESOURCE}: 'multipart' must be a list of paths")
+    stray = [p for p in multipart if p not in groups["write"] or groups["write"][p] != METHOD_POST]
+    if stray:
+        raise RuntimeError(f"{ENDPOINTS_RESOURCE}: multipart paths must be POST paths in the write group: {stray}")
+    return groups, frozenset(multipart)
+
+
+_GROUP_DATA, MULTIPART_PATHS = _load_endpoints(
+    resources.files(__package__).joinpath(ENDPOINTS_RESOURCE).read_text(encoding="utf-8"))
+SESSION_METHODS: Mapping[str, str] = MappingProxyType(_GROUP_DATA["session"])
+READ_METHODS: Mapping[str, str] = MappingProxyType(_GROUP_DATA["read"])
+WRITE_METHODS: Mapping[str, str] = MappingProxyType(_GROUP_DATA["write"])
 BINARY_READ_PATHS = frozenset({PATH_FLEET_QRCODE})         # answer is a PNG: read_bytes() only
-MULTIPART_PATHS = frozenset({PATH_FLEET_GENERATE_AC})      # body is multipart/form-data: write_multipart() only
 PORTAL_METHODS: Mapping[str, str] = MappingProxyType({**SESSION_METHODS, **READ_METHODS, **WRITE_METHODS})
 PORTAL_PATHS = frozenset(PORTAL_METHODS)
 READ_PATHS = frozenset(READ_METHODS)

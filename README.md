@@ -212,17 +212,70 @@ The body is serialized once as compact JSON, and that exact text is signed and s
 the URL, so the client accepts only `https://rsp.simlessly.com` (or `http://127.0.0.1`, `localhost`, `[::1]` for
 tests) and calls only ten fixed paths. Redirects are refused; responses over 1 MiB are rejected.
 
+## API change watch
+
+A GitHub Actions workflow (`.github/workflows/api-watch.yml`) checks the Simlessly API once a week (Mondays, 14:00 UTC,
+and on demand from the Actions tab). `tools/api_watch.py` reads the public documentation at `docs.simlessly.com` and the
+web portal's front-end files at `rsp.simlessly.com`, and compares them with the committed snapshot in `api-snapshot/`:
+
+- `docs.json`: for each endpoint in the RSP, eIM and CMP API reference, the method, URL, and request and response fields
+  (name, type, required).
+- `portal.json`: every `/api/` path the portal front-end calls, with its HTTP method, how the request is sent (JSON
+  body, query string, file upload) and the page module that uses it. The request helpers are identified by what they do
+  (setting `params` is a GET, setting `data` is a POST, a `FormData` body is an upload), not by their minified names.
+  A name that is defined as two different kinds of helper is not trusted: calls through it are left unclassified.
+  The page module is context only; a front-end rebuild that moves a path to another chunk is not a change.
+
+Only static pages and scripts are fetched. No `/api/` endpoint is called and nothing is signed in.
+
+If anything changed, the workflow runs the unit tests and opens or updates one pull request (branch `api-watch/update`)
+with the new snapshot and a report of the differences. The pull request is a draft when the tests fail. If the pages
+cannot be read or their structure is not recognized, the run fails and no pull request is made. A snapshot is also
+refused when it looks like a misreading: far fewer endpoints, documentation endpoints that lost their method or URL,
+many portal paths without a known method, a path the CLI uses that cannot be classified, or more than five portal
+methods (or 10% of them) changing at once.
+
+Applied automatically: the HTTP method of a portal path in the read group of `src/simlessly_cli/portal_endpoints.json`,
+when the portal now uses another method. Nothing else in the code changes, so the commands that use that path still
+build their request for the previous method (JSON body or query string). Expect the tests to fail, and the pull request
+to stay a draft, until the command is adapted by hand.
+
+Needs manual follow-up, listed in the pull request: method changes in the session and write groups (the login must stay
+a POST, and the CLI refuses to load a write path that is not), new portal paths (never added to the allowlist),
+allowlisted paths that disappeared, changes in how a request is sent, and changes to documented RSP API fields or
+endpoints. Only a person adds a path or moves it between the session, read and write groups.
+
+The workflow does not store its token in the git configuration; only the last steps receive it. It never overwrites commits
+that a person pushed to `api-watch/update` (it then only refreshes the pull request text), pushes with a lease, marks the
+pull request as a draft again when the tests fail, and closes the pull request when a later run finds nothing to change.
+
+Run it locally:
+
+```sh
+python3 tools/api_watch.py snapshot --out /tmp/api-new     # about four minutes: one request every 0.3 s; --force skips the sanity checks
+python3 tools/api_watch.py diff --new /tmp/api-new --report report.md
+python3 tools/api_watch.py apply --new /tmp/api-new --report report.md
+cp /tmp/api-new/*.json api-snapshot/
+```
+
+`diff` without `--new` fetches the live pages itself. In the repository settings, Actions must be allowed to create pull
+requests (Settings, Actions, General, Workflow permissions). GitHub pauses scheduled workflows after 60 days without
+repository activity.
+
 ## Development
 
 Source is in `src/simlessly_cli/`: `cli.py` (commands and the `mutate()` gate), `client.py` and `auth.py` (signed
 client), `config.py` and `store.py` (settings and secret stores), `output.py` (masking), `portal*.py` (portal).
+The portal's paths and HTTP methods are in `portal_endpoints.json`; `tools/api_watch.py` and `api-snapshot/` belong to
+the API change watch above.
 
 ```sh
 python3 -m unittest discover -s tests
 ```
 
 Tests use mock servers on `127.0.0.1`, a temporary home directory and fake `security` and `secret-tool`. They fail
-on any non-loopback network access.
+on any non-loopback network access. The mock portal rejects a request whose method differs from the one in
+`api-snapshot/portal.json`, so the CLI's own method data is checked against what the portal was last seen to use.
 
 ## License
 

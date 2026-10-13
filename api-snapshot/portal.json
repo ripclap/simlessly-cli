@@ -1,0 +1,945 @@
+{
+  "endpoints": {
+    "/api/v1/admin/analytic/downloadTrend": {
+      "method": "POST",
+      "modules": [
+        "AdminDashboard"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/admin/analytic/overview": {
+      "method": "GET",
+      "modules": [
+        "AdminDashboard"
+      ],
+      "transport": "query"
+    },
+    "/api/v1/admin/analytic/overviewMonthAndTotal": {
+      "method": "GET",
+      "modules": [
+        "AdminDashboard"
+      ],
+      "transport": "query"
+    },
+    "/api/v1/admin/analytic/redownload": {
+      "method": "POST",
+      "modules": [
+        "AdminDashboard"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/admin/analytic/registerTrend": {
+      "method": "POST",
+      "modules": [
+        "AdminDashboard"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/admin/analytic/topCustomersDownloadTrend": {
+      "method": "POST",
+      "modules": [
+        "AdminDashboard"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/admin/bip/list": {
+      "method": "POST",
+      "modules": [
+        "AdminBip"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/admin/client/add": {
+      "method": "POST",
+      "modules": [
+        "AdminClient"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/admin/client/delete": {
+      "method": "POST",
+      "modules": [
+        "AdminClient"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/admin/client/download": {
+      "method": "POST",
+      "modules": [
+        "AdminClient"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/admin/client/list": {
+      "method": "POST",
+      "modules": [
+        "AdminClient"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/admin/client/update": {
+      "method": "POST",
+      "modules": [
+        "AdminClient"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/admin/invitation/add": {
+      "method": "POST",
+      "modules": [
+        "AdminInvitationLink"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/admin/invitation/list": {
+      "method": "POST",
+      "modules": [
+        "AdminInvitationLink"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/admin/log/list": {
+      "method": "POST",
+      "modules": [
+        "AdminClient"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/admin/order/confirmPaid": {
+      "method": "POST",
+      "modules": [
+        "order"
+      ],
+      "transport": "multipart"
+    },
+    "/api/v1/admin/order/create": {
+      "method": "POST",
+      "modules": [
+        "admin-order"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/admin/order/download-billing": {
+      "method": "POST",
+      "modules": [
+        "admin-order"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/admin/order/edit": {
+      "method": "POST",
+      "modules": [
+        "admin-order"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/admin/order/list": {
+      "method": "POST",
+      "modules": [
+        "order"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/admin/order/modify/note": {
+      "method": "POST",
+      "modules": [
+        "order"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/analytic/ac-count": {
+      "method": "GET",
+      "modules": [
+        "home"
+      ],
+      "transport": "query"
+    },
+    "/api/v1/analytic/deviceBrand": {
+      "method": "GET",
+      "modules": [
+        "Dashboard"
+      ],
+      "transport": "query"
+    },
+    "/api/v1/analytic/downloadByDay": {
+      "method": "POST",
+      "modules": [
+        "Dashboard"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/analytic/downloadByMonth": {
+      "method": "POST",
+      "modules": [
+        "Dashboard"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/analytic/latest-week": {
+      "method": "GET",
+      "modules": [
+        "home"
+      ],
+      "transport": "query"
+    },
+    "/api/v1/analytic/percentage": {
+      "method": "GET",
+      "modules": [
+        "Dashboard"
+      ],
+      "transport": "query"
+    },
+    "/api/v1/analytic/profileStatus": {
+      "method": "GET",
+      "modules": [
+        "Dashboard"
+      ],
+      "transport": "query"
+    },
+    "/api/v1/analytic/redownload": {
+      "method": "POST",
+      "modules": [
+        "Dashboard"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/block/add": {
+      "method": "POST",
+      "modules": [
+        "Block"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/block/list": {
+      "method": "POST",
+      "modules": [
+        "Block"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/block/remove": {
+      "method": "POST",
+      "modules": [
+        "Block"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/campaign/change-status": {
+      "method": "POST",
+      "modules": [
+        "campaign"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/campaign/create": {
+      "method": "POST",
+      "modules": [
+        "campaign"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/campaign/list": {
+      "method": "GET",
+      "modules": [
+        "campaign"
+      ],
+      "transport": "query"
+    },
+    "/api/v1/campaign/resource/delete": {
+      "method": "POST",
+      "modules": [
+        "campaign"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/campaign/resource/import": {
+      "method": "POST",
+      "modules": [
+        "campaign"
+      ],
+      "transport": "multipart"
+    },
+    "/api/v1/campaign/resource/list": {
+      "method": "POST",
+      "modules": [
+        "campaign"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/campaign/resource/unlock": {
+      "method": "POST",
+      "modules": [
+        "campaign"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/config/add": {
+      "method": "POST",
+      "modules": [
+        "profileConfig"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/config/delete": {
+      "method": "POST",
+      "modules": [
+        "profileConfig"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/config/detail": {
+      "method": "GET",
+      "modules": [
+        "profileConfig"
+      ],
+      "transport": "query"
+    },
+    "/api/v1/config/name/query": {
+      "method": "GET",
+      "modules": [
+        "profile"
+      ],
+      "transport": "query"
+    },
+    "/api/v1/config/query": {
+      "method": "POST",
+      "modules": [
+        "profileConfig"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/config/recycle/query": {
+      "method": "GET",
+      "modules": [
+        "profileConfig"
+      ],
+      "transport": "query"
+    },
+    "/api/v1/config/update": {
+      "method": "POST",
+      "modules": [
+        "profileConfig"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/contact/feedback": {
+      "method": "POST",
+      "modules": [
+        "developer"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/developer/keys": {
+      "method": "GET",
+      "modules": [
+        "developer"
+      ],
+      "transport": "query"
+    },
+    "/api/v1/developer/keys/init": {
+      "method": "GET",
+      "modules": [
+        "developer"
+      ],
+      "transport": "query"
+    },
+    "/api/v1/developer/notificationURL/update": {
+      "method": "POST",
+      "modules": [
+        "developer"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/enterprise-dp/account/simple/all": {
+      "method": "GET",
+      "modules": [
+        "AdminEnterpriseDp"
+      ],
+      "transport": "query"
+    },
+    "/api/v1/enterprise-dp/add": {
+      "method": "POST",
+      "modules": [
+        "AdminEnterpriseDp"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/enterprise-dp/delete": {
+      "method": "POST",
+      "modules": [
+        "AdminEnterpriseDp"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/enterprise-dp/enterprise/simple/all": {
+      "method": "GET",
+      "modules": [
+        "AdminEnterpriseDp"
+      ],
+      "transport": "query"
+    },
+    "/api/v1/enterprise-dp/list": {
+      "method": "POST",
+      "modules": [
+        "AdminEnterpriseDp"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/enterprise-dp/update": {
+      "method": "POST",
+      "modules": [
+        "AdminEnterpriseDp"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/enterprise/add": {
+      "method": "POST",
+      "modules": [
+        "index"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/enterprise/behavior/query": {
+      "method": "GET",
+      "modules": [
+        "enterprise-behavior"
+      ],
+      "transport": "query"
+    },
+    "/api/v1/enterprise/behavior/save": {
+      "method": "POST",
+      "modules": [
+        "enterprise-behavior"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/enterprise/dp/account/list": {
+      "method": "POST",
+      "modules": [
+        "dp-account"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/enterprise/info": {
+      "method": "GET",
+      "modules": [
+        "index"
+      ],
+      "transport": "query"
+    },
+    "/api/v1/enterprise/list": {
+      "method": "GET",
+      "modules": [
+        "index"
+      ],
+      "transport": "query"
+    },
+    "/api/v1/enterprise/query": {
+      "method": "POST",
+      "modules": [
+        "admin-order"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/enterprise/switch": {
+      "method": "POST",
+      "modules": [
+        "index"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/enum/list": {
+      "method": "POST",
+      "modules": [
+        "useEnumDictionary"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/event/profile/push": {
+      "method": "POST",
+      "modules": [
+        "EidPush"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/event/profile/query": {
+      "method": "GET",
+      "modules": [
+        "EidPush"
+      ],
+      "transport": "query"
+    },
+    "/api/v1/fleet/delete": {
+      "method": "POST",
+      "modules": [
+        "profile"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/fleet/downloadPgpKey": {
+      "method": "GET",
+      "modules": [
+        "profile"
+      ],
+      "transport": "navigation"
+    },
+    "/api/v1/fleet/downloadTemplate": {
+      "method": "GET",
+      "modules": [
+        "profile"
+      ],
+      "transport": "navigation"
+    },
+    "/api/v1/fleet/generateAc": {
+      "method": "POST",
+      "modules": [
+        "profile"
+      ],
+      "transport": "multipart"
+    },
+    "/api/v1/fleet/list": {
+      "method": "POST",
+      "modules": [
+        "profile"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/fleet/qrcode": {
+      "method": "POST",
+      "modules": [
+        "profile"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/fleet/re-generate": {
+      "method": "POST",
+      "modules": [
+        "profile"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/fleet/recycle": {
+      "method": "POST",
+      "modules": [
+        "profile"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/fleet/recycle/query": {
+      "method": "POST",
+      "modules": [
+        "profile"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/fleet/single-generate": {
+      "method": "POST",
+      "modules": [
+        "AcGeneration"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/fleet/transaction": {
+      "method": "POST",
+      "modules": [
+        "profile"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/fleet/update-notes": {
+      "method": "POST",
+      "modules": [
+        "profile"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/group/add": {
+      "method": "POST",
+      "modules": [
+        "group"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/group/batchGroup": {
+      "method": "POST",
+      "modules": [
+        "group"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/group/delete": {
+      "method": "POST",
+      "modules": [
+        "group"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/group/list": {
+      "method": "POST",
+      "modules": [
+        "group"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/log/batch-task/list": {
+      "method": "POST",
+      "modules": [
+        "batch"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/log/profile/detail": {
+      "method": "GET",
+      "modules": [
+        "profile"
+      ],
+      "transport": "query"
+    },
+    "/api/v1/log/profile/list": {
+      "method": "POST",
+      "modules": [
+        "profile"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/log/recycle/list": {
+      "method": "POST",
+      "modules": [
+        "profile"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/log/tour/finished": {
+      "method": "POST",
+      "modules": [
+        "batch"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/oauth/register": {
+      "method": "POST",
+      "modules": [
+        "index"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/oauth/render/login/{}/{}": {
+      "method": "GET",
+      "modules": [
+        "index"
+      ],
+      "transport": "query"
+    },
+    "/api/v1/oauth/render/signup/{}/{}": {
+      "method": "GET",
+      "modules": [
+        "index"
+      ],
+      "transport": "query"
+    },
+    "/api/v1/order/cancel": {
+      "method": "POST",
+      "modules": [
+        "order"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/order/create": {
+      "method": "POST",
+      "modules": [
+        "index"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/order/detail": {
+      "method": "POST",
+      "modules": [
+        "admin-order"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/order/invoice/download": {
+      "method": "POST",
+      "modules": [
+        "order"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/order/list": {
+      "method": "POST",
+      "modules": [
+        "order"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/order/paid": {
+      "method": "POST",
+      "modules": [
+        "order"
+      ],
+      "transport": "multipart"
+    },
+    "/api/v1/order/query": {
+      "method": "GET",
+      "modules": [
+        "index"
+      ],
+      "transport": "query"
+    },
+    "/api/v1/order/queryBillInfo": {
+      "method": "POST",
+      "modules": [
+        "order"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/order/queryLastOrder": {
+      "method": "GET",
+      "modules": [
+        "order"
+      ],
+      "transport": "query"
+    },
+    "/api/v1/permission/getUserPermissions": {
+      "method": "POST",
+      "modules": [
+        "index"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/permission/list": {
+      "method": "POST",
+      "modules": [
+        "role"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/plan/cancelSubscription": {
+      "method": "POST",
+      "modules": [
+        "index"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/plan/list": {
+      "method": "POST",
+      "modules": [
+        "index"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/plan/queryOrder": {
+      "method": "POST",
+      "modules": [
+        "index"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/platform/query": {
+      "method": "GET",
+      "modules": [
+        "index"
+      ],
+      "transport": "fetch"
+    },
+    "/api/v1/qrcode/edit": {
+      "method": "POST",
+      "modules": [
+        "ProfileConfigForm"
+      ],
+      "transport": "multipart"
+    },
+    "/api/v1/qrcode/logo/{}": {
+      "method": "GET",
+      "modules": [
+        "ProfileConfigForm"
+      ],
+      "transport": "query"
+    },
+    "/api/v1/qrcode/query": {
+      "method": "GET",
+      "modules": [
+        "ProfileConfigForm"
+      ],
+      "transport": "query"
+    },
+    "/api/v1/qrcode/upload": {
+      "method": "POST",
+      "modules": [
+        "ProfileConfigForm"
+      ],
+      "transport": "multipart"
+    },
+    "/api/v1/report/config/export": {
+      "method": "POST",
+      "modules": [
+        "Report"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/report/config/query": {
+      "method": "POST",
+      "modules": [
+        "Report"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/role/delete": {
+      "method": "POST",
+      "modules": [
+        "role"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/role/list": {
+      "method": "POST",
+      "modules": [
+        "role"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/role/save": {
+      "method": "POST",
+      "modules": [
+        "role"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/user/add": {
+      "method": "POST",
+      "modules": [
+        "index"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/user/behavior/query": {
+      "method": "POST",
+      "modules": [
+        "index"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/user/behavior/save": {
+      "method": "POST",
+      "modules": [
+        "index"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/user/changePassword": {
+      "method": "POST",
+      "modules": [
+        "index"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/user/deactivate": {
+      "method": "POST",
+      "modules": [
+        "index"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/user/delete": {
+      "method": "POST",
+      "modules": [
+        "index"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/user/feedback": {
+      "method": "POST",
+      "modules": [
+        "user-feedback"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/user/feedback/close": {
+      "method": "GET",
+      "modules": [
+        "user-feedback"
+      ],
+      "transport": "query"
+    },
+    "/api/v1/user/feedback/query": {
+      "method": "GET",
+      "modules": [
+        "user-feedback"
+      ],
+      "transport": "query"
+    },
+    "/api/v1/user/group/change": {
+      "method": "POST",
+      "modules": [
+        "index"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/user/list": {
+      "method": "POST",
+      "modules": [
+        "index"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/user/login": {
+      "method": "POST",
+      "modules": [
+        "index"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/user/logout": {
+      "method": "GET",
+      "modules": [
+        "index"
+      ],
+      "transport": "query"
+    },
+    "/api/v1/user/register": {
+      "method": "POST",
+      "modules": [
+        "index"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/user/resend/invitation": {
+      "method": "POST",
+      "modules": [
+        "index"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/user/send/forget": {
+      "method": "POST",
+      "modules": [
+        "index"
+      ],
+      "transport": "json"
+    },
+    "/api/v1/user/verify": {
+      "method": "POST",
+      "modules": [
+        "index"
+      ],
+      "transport": "json"
+    }
+  },
+  "schema": 1,
+  "session_cookies": [
+    "simlessly_aside_fold",
+    "simlessly_token"
+  ],
+  "session_headers": [
+    "Simlessly-RequestID",
+    "Simlessly-TimeZone",
+    "Simlessly-Timestamp",
+    "Simlessly-Token"
+  ],
+  "session_invalid_codes": [
+    "10102",
+    "10103",
+    "10206"
+  ],
+  "source": "https://rsp.simlessly.com"
+}
