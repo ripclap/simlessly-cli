@@ -1,7 +1,7 @@
 import unittest
 
 import support  # noqa: F401
-from simlessly_cli.output import (Redactor, kv, mask_tail, mask_text, normalize_status, sanitize, status_meaning,
+from simlessly_cli.output import (Redactor, clean, kv, mask_tail, mask_text, normalize_status, sanitize, status_meaning,
                                   table)
 
 
@@ -38,6 +38,37 @@ class MaskingTests(unittest.TestCase):
     def test_table_and_kv_align(self):
         self.assertEqual(table(["a", "bb"], [["1", "2"], ["333", "4"]]).splitlines()[0], "a    bb")
         self.assertEqual(kv([("a", 1), ("bbb", 2)]).splitlines(), ["a    1", "bbb  2"])
+
+
+CONTROLS = "\x1b\x7f\x80\x85\x9b\x9d\x9f\u2028\u2029"
+BIDI = "\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069"
+UNSAFE = CONTROLS + BIDI
+PRINTABLE = "caf\u00e9 na\u00efve \u00a0nbsp \u65e5\u672c\u8a9e \U0001f600 \u0627\u0644 \u2019q\u2019 \u00a1\u00bf"
+
+
+class CleanTests(unittest.TestCase):
+    def test_controls_and_separators_become_a_space(self):
+        for ch in CONTROLS:
+            self.assertEqual(clean("a" + ch + "b"), "a b", hex(ord(ch)))
+        self.assertEqual(clean("a\nb\tc\x00d"), "a b c d")
+
+    def test_bidi_marks_and_controls_are_removed(self):
+        for ch in BIDI:
+            self.assertEqual(clean("a" + ch + "b"), "ab", hex(ord(ch)))
+        # A right-to-left name with its marks keeps its shape (no extra spaces).
+        self.assertEqual(clean("\u05e9\u05dc\u05d5\u05dd\u200f (x)"), "\u05e9\u05dc\u05d5\u05dd (x)")
+
+    def test_ordinary_printable_characters_survive(self):
+        self.assertEqual(clean(PRINTABLE), PRINTABLE)
+
+    def test_limit_still_applies(self):
+        self.assertEqual(clean("abcdef", 4), "abc\u2026")
+
+    def test_tables_and_key_value_lists_never_show_them(self):
+        text = table(["h"], [["x" + UNSAFE + "y"], [PRINTABLE]]) + kv([("k", "x" + UNSAFE + "y")])
+        for ch in UNSAFE:
+            self.assertNotIn(ch, text, hex(ord(ch)))
+        self.assertIn(PRINTABLE, text)
 
 
 class StatusTests(unittest.TestCase):

@@ -488,7 +488,7 @@ class OptionalSettingsTests(CliTestCase, TmpMixin):
         with fake_platform("darwin", Runner(self.keychain_handler), ("security",)):
             code, out, err = self.run_cli("profile", "expire", ICCID, env=self.env, keychain=config.keychain_lookup)
         self.assertEqual(code, 2, err)  # a dry run, as before
-        self.assertIn("Would send", out)
+        self.assertIn("Dry run", out)
         self.assertIn("https://rsp.simlessly.com", out)  # the default, not the refused file's base-url
         self.assertNotIn("127.0.0.1:9", out)
         self.assertIn("warning:", err)

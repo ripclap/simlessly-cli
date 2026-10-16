@@ -76,10 +76,17 @@ def mask_text(text: str, redactor: Redactor | None = None, imsi_text: bool = Fal
     return _IMSI_RE.sub(lambda m: mask_tail(m.group(0)), text) if imsi_text else text
 
 
+# Characters that could move the cursor, hide text or reorder what a terminal shows. C0 and C1 controls and
+# the line and paragraph separators become a space; the bidirectional marks and controls are removed, so
+# right-to-left names keep their shape. Ordinary printable text is kept.
+_UNSAFE_CHARS_RE = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+_BIDI_CHARS_RE = re.compile("[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+
+
 def clean(value: Any, limit: int | None = None) -> str:
     """One line without control characters, for a table cell."""
     text = "" if value is None else str(value)
-    text = re.sub(r"[\x00-\x1f\x7f]", " ", text)
+    text = _UNSAFE_CHARS_RE.sub(" ", _BIDI_CHARS_RE.sub("", text))
     if limit and len(text) > limit:
         text = text[: limit - 1] + "…"
     return text

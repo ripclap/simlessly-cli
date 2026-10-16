@@ -325,11 +325,17 @@ _CONFIG_ID_RE = re.compile(r"\d+|[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0
 
 
 def _resolve_config(ctx: Ctx, value: str) -> str:
-    """--config as a configId. A number or UUID is the id; anything else is a name, looked up with one
-    config/name/query call and matched case-insensitively against any string field."""
+    """--config as a configId (see _resolve_config_named)."""
+    return _resolve_config_named(ctx, value)[0]
+
+
+def _resolve_config_named(ctx: Ctx, value: str) -> tuple[str, str | None]:
+    """--config as (configId, name). A number or UUID is the id, with no name (no extra lookup is made);
+    anything else is a name, looked up with one config/name/query call and matched case-insensitively
+    against any string field."""
     value = _check(r"[^\x00-\x1f\x7f]{1,128}", value, "--config")
     if _CONFIG_ID_RE.fullmatch(value):
-        return value
+        return value, None
     obj = _read(ctx, portal.PATH_CONFIG_NAME_QUERY, {"filterDemo": False})
     items = list(_config_items(obj))
     if not items:
@@ -338,7 +344,8 @@ def _resolve_config(ctx: Ctx, value: str) -> str:
     wanted = value.lower()
     ids = sorted({i for _, strings, i in items if i is not None and any(s.lower() == wanted for s in strings)})
     if len(ids) == 1:
-        return ids[0]
+        shown = next((clean(n, 80) for n, strings, i in items if i == ids[0] and any(x.lower() == wanted for x in strings)), value)
+        return ids[0], shown
     if ids:
         raise UsageError(f"--config {value!r}: several configurations have that name; pass the configId")
     if any(any(s.lower() == wanted for s in strings) for _, strings, _ in items):

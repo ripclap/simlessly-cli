@@ -74,8 +74,10 @@ class GateTests(WriteCase):
             self.server.requests.clear()
             code, out, err = self.run_cli("portal", *argv, *(["--force"] if name in ("regenerate", "recycle", "delete") else []))
             self.assertEqual(code, 2, (name, err))
-            self.assertIn("Would send (dry run", out)
-            self.assertIn("dry run: nothing was changed", err)
+            self.assertTrue(out.startswith("Dry run"), out)
+            self.assertIn("nothing has been sent", out)
+            self.assertIn("To send:  add --yes", out)
+            self.assertEqual(err, "")
             self.assertClean(out, err)
             self.assertNothingWritten()
             for rec in self.server.requests:                           # the preview only reads
@@ -247,8 +249,8 @@ class MetadataTests(WriteCase):
         code, out, err = self.run_cli("portal", "notes", ICCID, "--clear")
         self.assertEqual(code, 2)
         self.assertIn('{"ids":[4242],"notes":""}', out)
-        self.assertIn("current note: 'ward 7'", out)
-        self.assertIn("no charge", out)
+        self.assertIn("Current note: 'ward 7'.", out)
+        self.assertIn("no charge documented", out)
         code, out, err = self.run_cli("portal", "notes", ICCID, "--clear", "--yes")
         self.assertEqual(code, 0)
         self.assertEqual(self.only_write("/api/v1/fleet/update-notes").body, '{"ids":[4242],"notes":""}')
@@ -286,7 +288,8 @@ class MetadataTests(WriteCase):
         code, out, err = self.run_cli("portal", "group-assign", ICCID, "--group", "pilot")
         self.assertEqual(code, 2)
         self.assertIn("metadata only", out)
-        self.assertIn("profile  ", out)
+        self.assertIn("Target     ICCID " + ICCID, out)
+        self.assertIn("Currently  status AVAILABLE", out)
 
     def test_group_create(self):
         code, out, err = self.run_cli("portal", "group-create", "Wave 2", "--note", "second wave", "--yes")
@@ -322,7 +325,7 @@ class GuardTests(WriteCase):
                 self.server.requests.clear()
                 code, out, err = self.run_cli("portal", *argv, "--yes")
                 self.assertEqual(code, 1, (name, status))
-                self.assertIn("refusing to", err)
+                self.assertIn("Refused. Nothing was sent.", err)
                 self.assertIn("on, or possibly on, a phone", err)
                 self.assertIn("--force", err)
                 self.assertIn("Nothing was sent", err)
@@ -600,9 +603,15 @@ class GenerateAcTests(WriteCase):
     def test_dry_run_shows_fields_and_billing_but_never_the_content(self):
         code, out, err = self.run_cli("portal", *self.argv("--picture"))
         self.assertEqual(code, 2)
-        for text in ("BILLABLE", "configId=77", "uploadType=1", "acFormats=STRING", "acFormats=PICTURE", "records.gpg",
-                     "sha256", "content not shown", "batch-logs", "multipart/form-data"):
+        for text in ("BILLABLE", "Config   77", "PGP encrypted", "activation code text (STRING), QR picture (PICTURE)",
+                     "records.gpg", "sha256", "content not shown", "batch-logs", "POST " + self.server.url):
             self.assertIn(text, out)
+        self.assertNotIn("multipart", out)              # the wire format is under --debug
+        code, out, err = self.run_cli("portal", *self.argv("--picture"), "--debug")
+        for text in ("Headers", "Content-Type: multipart/form-data", "configId=77", "uploadType=1", "acFormats=PICTURE"):
+            self.assertIn(text, out)
+        self.assertNotIn("SECRETPAYLOAD", out + err)
+        self.assertNotIn(TOKEN, out + err)
         self.assertNotIn("SECRETPAYLOAD", out + err)
         self.assertNothingWritten()
         code, out, err = self.run_cli("portal", *self.argv(), "--json")
@@ -627,7 +636,7 @@ class GenerateAcTests(WriteCase):
     def test_plain_spreadsheet_warns_and_uses_upload_type_0(self):
         code, out, err = self.run_cli("portal", *self.argv(file=self.xlsx, kind="plain"))
         self.assertEqual(code, 2)
-        self.assertIn("uploadType=0", out)
+        self.assertIn("plain spreadsheet", out)
         self.assertIn("without the PGP layer", out)
         code, out, err = self.run_cli("portal", *self.argv(file=self.xlsx, kind="plain"), "--yes")
         self.assertEqual(code, 0, err)
@@ -692,13 +701,238 @@ class GenerateAcTests(WriteCase):
         self.plan_type, self.ac_count = "DEFAULT", 0
         code, out, err = self.run_cli("portal", *self.argv())
         self.assertEqual(code, 2)
-        self.assertIn("planType='DEFAULT', acCount=0", out)
+        self.assertIn("Plan     DEFAULT \u00b7 0 profiles generated so far", out)
         self.assertEqual(self.run_cli("portal", *self.argv(), "--yes")[0], 0)
         self.server.requests.clear()
         self.plan_type, self.ac_count = "PRO", 500
         self.assertEqual(self.run_cli("portal", *self.argv(), "--yes")[0], 0)
         paths = [r.path for r in self.server.requests]
         self.assertEqual(paths, ["/api/v1/plan/queryOrder", "/api/v1/analytic/ac-count", "/api/v1/fleet/generateAc"])
+
+
+# ------------------------------------------------------------------ masking, wording, refusals
+
+CODE = "LPA:1$smdp.example.com$ABCD1234EFGH5678"
+HEX32 = "0123456789abcdef0123456789abcdef"
+RAW_PIECES = ("ABCD1234EFGH5678", "smdp.example.com", HEX32)
+
+
+class TypedTextMaskingTests(WriteCase):
+    def assertEveryLineMasked(self, text):
+        for line in text.split("\n"):
+            for raw in RAW_PIECES:
+                self.assertNotIn(raw, line, line)
+
+    def test_a_note_that_looks_like_an_activation_code_is_masked_on_every_line(self):
+        code, out, err = self.run_cli("portal", "notes", ICCID, CODE)
+        self.assertEqual(code, 2)
+        self.assertEveryLineMasked(out + err)
+        row = next(ln for ln in out.split("\n") if ln.startswith("New note"))
+        self.assertIn("'****5678'", row)
+        self.assertIn('"notes":"****5678"', out)
+        self.assertNothingWritten()
+        code, out, err = self.run_cli("portal", "notes", ICCID, CODE, "--yes")
+        self.assertEqual(code, 0, err)
+        self.assertEveryLineMasked(out + err)
+
+    def test_a_note_that_looks_like_a_key_is_masked_on_every_line(self):
+        code, out, err = self.run_cli("portal", "notes", ICCID, HEX32)
+        self.assertEqual(code, 2)
+        self.assertEveryLineMasked(out + err)
+        row = next(ln for ln in out.split("\n") if ln.startswith("New note"))
+        self.assertIn("'****cdef'", row)
+
+    def test_group_names_and_notes_are_masked_on_every_line(self):
+        for name, note, tail in ((CODE, HEX32, "5678"), (HEX32, CODE, "cdef")):
+            code, out, err = self.run_cli("portal", "group-create", name, "--note", note)
+            self.assertEqual(code, 2)
+            self.assertEveryLineMasked(out + err)
+            self.assertIn("Group    ****" + tail, out)
+            self.assertIn("Action   Create the profile group '****" + tail + "'.", out)
+            self.assertIn("Effect   creates the profile group '****" + tail + "'", out)
+            self.assertIn("Note     ****", out)
+            code, out, err = self.run_cli("portal", "group-create", name, "--note", note, "--yes")
+            self.assertEqual(code, 0, err)
+            self.assertIn("Group '****" + tail + "' created.", out)
+            self.assertEveryLineMasked(out + err)
+
+    def test_a_refusal_naming_a_code_shaped_group_is_masked(self):
+        self.route("/api/v1/group/list", [{"id": 9, "name": CODE, "count": 0, "note": ""}])
+        self.profile_extra = {"createBy": "demo"}
+        code, out, err = self.run_cli("portal", "group-assign", ICCID, "--group", "9", "--yes")
+        self.assertEqual(code, 1)
+        self.assertIn("Refused.", err)
+        self.assertIn("****5678", err)
+        self.assertEveryLineMasked(out + err)
+        self.assertNothingWritten()
+
+    def test_the_json_dry_run_is_masked_too(self):
+        code, out, err = self.run_cli("portal", "group-create", CODE, "--json")
+        self.assertEqual(code, 2)
+        self.assertEveryLineMasked(out + err)
+        self.assertIn("****5678", out)
+
+
+class GenerateAcPlanRowTests(WriteCase):
+    def setUp(self):
+        super().setUp()
+        self.gpg = self.tmp / "records.gpg"
+        self.gpg.write_bytes(b"-----BEGIN PGP MESSAGE-----\nX\n-----END PGP MESSAGE-----\n")
+
+    def plan_line(self):
+        code, out, err = self.run_cli("portal", "generate-ac", "--config", "77", "--file", str(self.gpg),
+                                      "--upload-type", "pgp")
+        self.assertEqual(code, 2, err)
+        return next(ln for ln in out.split("\n") if ln.startswith("Plan"))
+
+    def test_the_count_is_stated_only_when_it_is_a_real_integer(self):
+        not_reported = "profiles generated: not reported"
+        for count, expected in ((5, "5 profiles generated so far"), (1, "1 profile generated so far"),
+                                (0, "0 profiles generated so far"), (None, not_reported), ("abc", not_reported),
+                                (True, not_reported), (2.5, not_reported)):
+            self.ac_count = count
+            self.assertEqual(self.plan_line(), "Plan     PRO · " + expected + " · checked as the website does",
+                             count)
+
+
+    def test_generate_ac_note_bullets_are_capitalised_sentences(self):
+        sheet = self.tmp / "records.xlsx"
+        sheet.write_bytes(b"PK\x03\x04plain-sheet")
+        code, out, err = self.run_cli("portal", "generate-ac", "--config", "77", "--file", str(sheet),
+                                      "--upload-type", "plain")
+        self.assertEqual(code, 2, err)
+        found = bullets_of(out)
+        self.assertEqual(len(found), 3, out)
+        for bullet in found:
+            self.assertRegex(bullet, r"^[A-Z].*\.$", bullet)
+
+
+class RegenerateConfirmationTests(WriteCase):
+    def test_the_confirmation_does_not_repeat_the_batch_logs_pointer(self):
+        code, out, err = self.run_cli("portal", "regenerate", ICCID, "--yes")
+        self.assertEqual(code, 0, err)
+        first, _, rest = out.partition("\n\n")
+        self.assertEqual(first, f"Sent. Re-generate submitted for {ICCID}. The portal processes it in the background.")
+        self.assertIn("Then:    simlessly portal batch-logs --type RE_GENERATE", rest)
+
+
+def bullets_of(text):
+    """The note bullets of a preview, each joined onto one line."""
+    if "\nNotes\n" not in text:
+        return []
+    block = text.split("\nNotes\n", 1)[1].split("\n\n", 1)[0]
+    result = []
+    for line in block.split("\n"):
+        if line.startswith("  - "):
+            result.append(line[4:])
+        elif line.startswith("    ") and result:
+            result[-1] += " " + line.strip()
+    return result
+
+
+class WordingTests(WriteCase):
+    def test_note_bullets_are_capitalised_sentences_and_the_cost_phrase_is_the_same(self):
+        self.status, self.awaiting = "ENABLED", True
+        self.profile_extra = {"notes": "ward 7"}
+        cases = [["notes", ICCID, "x"], ["group-assign", ICCID, "--group", "pilot"], ["group-create", "g"],
+                 ["regenerate", ICCID, "--picture", "--expire-time", "2099/01/02 03:04:05", "--force"],
+                 ["recycle", ICCID, "--at", "2099/01/02 14", "--force"], ["delete", ICCID, "--force"]]
+        seen = 0
+        for argv in cases:
+            code, out, err = self.run_cli("portal", *argv)
+            self.assertEqual(code, 2, (argv, err))
+            for bullet in bullets_of(out):
+                seen += 1
+                self.assertRegex(bullet, r"^[A-Z].*[.)]$", (argv, bullet))
+            cost = next(ln for ln in out.split("\n") if ln.startswith("Cost"))
+            self.assertNotEqual(cost.split(None, 1)[1], "no charge", argv)
+        self.assertGreaterEqual(seen, 8)
+        code, out, err = self.run_cli("portal", "delete", ICCID, "--force", "--json")
+        for note in json.loads(out)["notes"]:
+            self.assertRegex(note, r"^[A-Z].*[.)]$", note)
+
+    def test_the_forced_note_ends_with_a_full_stop_even_after_the_websites_warning(self):
+        self.status = "ENABLED"
+        code, out, err = self.run_cli("portal", "delete", ICCID, "--force")
+        self.assertEqual(code, 2)
+        forced = [b for b in bullets_of(out) if b.startswith("FORCED")]
+        self.assertEqual(len(forced), 1)
+        self.assertIn(WARN_DELETE, forced[0])
+        self.assertTrue(forced[0].endswith("."), forced[0])
+
+
+def action_row(text):
+    """The sentence in the Action row (the label's padding differs between a dry run and a refusal)."""
+    return next(ln for ln in text.split("\n") if ln.startswith("Action")).split(None, 1)[1]
+
+
+class RefusalActionTests(WriteCase):
+    """Every refusal repeats the Action row of the command's dry run, as one complete sentence."""
+
+    COMMANDS = {
+        "notes": ["notes", ICCID, "hello"],
+        "clear": ["notes", ICCID, "--clear"],
+        "group-assign": ["group-assign", ICCID, "--group", "pilot"],
+        "regenerate": ["regenerate", ICCID],
+        "recycle": ["recycle", ICCID, "--at", "2099/01/02 14"],
+        "delete": ["delete", ICCID],
+    }
+
+    def setUp(self):
+        super().setUp()
+        self.gpg = self.tmp / "records.gpg"
+        self.gpg.write_bytes(b"-----BEGIN PGP MESSAGE-----\nX\n-----END PGP MESSAGE-----\n")
+
+    def dry_action(self, argv):
+        self.status, self.awaiting, self.profile_extra = "AVAILABLE", False, {}
+        if argv[0] == "recycle":
+            self.status, self.awaiting = "DOWNLOADED", True
+        code, out, err = self.run_cli("portal", *argv)
+        self.assertEqual(code, 2, err)
+        row = action_row(out)
+        self.assertTrue(row.endswith("."), row)
+        return row
+
+    def refusal(self, argv, **conditions):
+        for key, value in conditions.items():
+            setattr(self, key, value)
+        code, out, err = self.run_cli("portal", *argv, "--yes")
+        self.assertEqual(code, 1, (argv, err))
+        self.assertNothingWritten()
+        self.assertTrue(err.startswith("Refused. Nothing was sent."), err)
+        return action_row(err)
+
+    def test_demo_profiles(self):
+        for name, argv in self.COMMANDS.items():
+            expected = self.dry_action(argv)
+            self.assertEqual(self.refusal(argv, profile_extra={"createBy": "demo"}), expected, name)
+
+    def test_unmanaged_profiles(self):
+        for name in ("regenerate", "delete"):
+            argv = self.COMMANDS[name]
+            expected = self.dry_action(argv)
+            self.assertEqual(self.refusal(argv, profile_extra={"campaignFlag": "1"}), expected, name)
+
+    def test_profiles_that_may_be_on_a_phone_or_have_no_status(self):
+        for name in ("regenerate", "delete"):
+            argv = self.COMMANDS[name]
+            expected = self.dry_action(argv)
+            self.assertEqual(self.refusal(argv, status="ENABLED"), expected, name)
+        argv = self.COMMANDS["recycle"]
+        expected = self.dry_action(argv)
+        self.assertEqual(self.refusal(argv, status="", awaiting=True), expected)
+
+    def test_recycle_states_that_do_not_allow_the_change(self):
+        argv = self.COMMANDS["recycle"]
+        expected = self.dry_action(argv)
+        self.assertEqual(self.refusal(argv, status="AVAILABLE", awaiting=True), expected)
+        self.assertEqual(self.refusal(argv, status="ENABLED", awaiting=False), expected)
+
+    def test_the_free_plan(self):
+        argv = ["generate-ac", "--config", "77", "--file", str(self.gpg), "--upload-type", "pgp"]
+        expected = self.dry_action(argv)
+        self.assertEqual(expected, "Upload records.gpg and create profiles from its records.")
+        self.assertEqual(self.refusal(argv, plan_type="DEFAULT", ac_count=3), expected)
 
 
 if __name__ == "__main__":

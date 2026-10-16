@@ -26,9 +26,10 @@ from typing import Any
 from . import portal
 from .cli import DryRun, Ctx, UsageError, _check, iccid_arg
 from .client import SimlesslyError
-from .output import NOT_PROOF, STATUS_MEANING, kv, mask_text, normalize_status, sanitize
+from .output import NOT_PROOF, STATUS_MEANING, mask_text, normalize_status, sanitize
+from .preview import Look, Preview, Refusal, pluralize, render_preview
 from . import portal_cli
-from .portal_cli import _client, _read, _resolve_config, _stored_token
+from .portal_cli import _client, _read, _resolve_config_named, _stored_token
 from .portal_read import ON_PHONE_STATUSES, _need_dict, _need_list, find_profile, recycle_states
 
 # The website's warning texts.
@@ -49,23 +50,40 @@ _RECYCLE_CLEAR = {"RECYCLED", "INVALID"}
 _FALSE_WORDS = {"", "0", "false", "no", "off", "null", "none"}
 
 
-def _refused(message: str) -> SimlesslyError:
-    return SimlesslyError(message, kind="refused")
+def _refused(reason: str, **more: Any) -> Refusal:
+    return Refusal([reason], **more)
 
 
 # ------------------------------------------------------------------ the gate
 
+def _profile_rows(context: dict[str, Any], look: Look) -> list[tuple[str, str]]:
+    """Target and current state of the profile a command acts on."""
+    rows = [("Target", f"ICCID {context.get('iccid')} (portal id {context.get('id')})")]
+    state = [f"{label} {context[key]}" for label, key in (("status", "status"), ("configuration", "configuration"),
+                                                          ("group", "group")) if context.get(key) not in (None, "")]
+    if state:
+        rows.append(("Currently", look.sep.join(state)))
+    return rows
+
+
 def portal_mutate(ctx: Ctx, *, path: str, effect: str, cost: str, body: dict[str, Any] | None = None,
                   upload: dict[str, Any] | None = None, notes: list[str] | None = None,
-                  context: dict[str, Any] | None = None, check_hint: str) -> Any:
+                  context: dict[str, Any] | None = None, check_hint: str, action: str | None = None,
+                  rows: list[tuple[str, str]] | None = None, human_notes: list[str] | None = None,
+                  then: list[str] | None = None) -> Any:
     """Send a state-changing portal request once, only with --yes; otherwise print the preview and raise DryRun.
 
-    `upload` (generate-ac only) is {"fields": [(name, value)...], "filename", "content"}."""
+    `upload` (generate-ac only) is {"fields": [(name, value)...], "filename", "content"}.
+    `action` is one plain sentence and `rows` the specifics for the preview; `notes` feed --json, and the
+    preview shows `human_notes` instead when given. `then` lists the follow-up commands."""
     if path not in portal.WRITE_PATHS:
         raise SimlesslyError(f"refusing to call portal path {path}: it is not one of the state-changing portal calls "
                              "this tool implements", kind="config")
     url = portal.build_portal_url(ctx.settings.base_url(), path)
-    notes = [mask_text(n, ctx.redactor, imsi_text=True) for n in (notes or [])]
+    mask = lambda text: mask_text(text, ctx.redactor, imsi_text=True)   # typed text can look like a code or a key
+    notes = [mask(n) for n in (notes or [])]
+    effect = mask(effect)
+    action = mask(action) if action else None
     if upload is not None:
         digest = hashlib.sha256(upload["content"]).hexdigest()[:16]
         shown: Any = {"fields": [[k, v] for k, v in upload["fields"]],
@@ -77,27 +95,31 @@ def portal_mutate(ctx: Ctx, *, path: str, effect: str, cost: str, body: dict[str
         shown = sanitize({k: v for k, v in (body or {}).items() if v is not None}, ctx.redactor, reveal=True)
         body_line = json.dumps(shown, separators=(",", ":"), ensure_ascii=False)
         kind = "application/json"
+    method = portal.WRITE_METHODS[path]
     if not ctx.args.yes:
         if ctx.args.json:
-            ctx.show_json({"dry_run": True, "method": portal.WRITE_METHODS[path], "url": url, "body": shown,
+            ctx.show_json({"dry_run": True, "method": method, "url": url, "body": shown,
                            "effect": effect, "cost": cost, "notes": notes, **({"profile": context} if context else {})})
+            ctx.warn("dry run: nothing was changed. Add --yes to send this request.")
         else:
-            ctx.say("Would send (dry run, nothing state-changing sent yet):")
-            ctx.say(kv([
-                ("request", f"{portal.WRITE_METHODS[path]} {url}"),
-                ("headers", f"Content-Type: {kind}, plus Simlessly-Token, Simlessly-Timestamp, Simlessly-RequestID and "
-                            "Simlessly-TimeZone added at send time (the token is never shown)"),
-                ("body", body_line),
-                *([("profile", ", ".join(f"{k}={v}" for k, v in context.items() if v not in (None, "")))] if context else []),
-                ("effect", effect),
-                ("cost", cost),
-                *[("note", n) for n in notes],
-            ]))
-        ctx.warn("dry run: nothing was changed. Add --yes to send this request.")
+            look = ctx.look
+            preview = Preview(
+                action=action or effect[:1].upper() + effect[1:], cost=cost, effect=effect, method=method, url=url,
+                rows=[(label, mask(value)) for label, value in
+                      [*(_profile_rows(context, look) if context else []), *(rows or [])]],
+                body=body_line if upload is None else None,
+                notes=[mask(n) for n in human_notes] if human_notes is not None else notes,
+                then=list(then or []),
+                debug_rows=[("Headers", f"Content-Type: {kind}, plus Simlessly-Token, Simlessly-Timestamp, "
+                                        "Simlessly-RequestID and Simlessly-TimeZone added at send time "
+                                        "(the token is never shown)"),
+                            *([("Raw body", body_line)] if upload is not None else [])])
+            ctx.say(render_preview(preview, look, debug=ctx.args.debug))
         raise DryRun
     client = _client(ctx, _stored_token(ctx))
     ctx.check_hint = check_hint
     ctx.mutated = True
+    ctx.sent = (method, url, tuple(then or []))
     if upload is not None:
         return client.write_multipart(path, upload["fields"], upload["filename"], upload["content"])
     return client.write(path, body)
@@ -107,7 +129,7 @@ def _finish(ctx: Ctx, obj: Any, done: str, extra: dict[str, Any] | None = None) 
     if ctx.args.json:
         ctx.show_json({"success": True, **(extra or {}), **({"result": sanitize(obj, ctx.redactor)} if obj is not None else {})})
     else:
-        ctx.say(done)
+        ctx.confirm(done)
     return 0
 
 
@@ -126,10 +148,10 @@ def _context(row: dict[str, Any]) -> dict[str, Any]:
             "configuration": row.get("configName") or row.get("configurationName"), "group": row.get("groupName")}
 
 
-def _refuse_demo(row: dict[str, Any]) -> None:
+def _refuse_demo(row: dict[str, Any], action: str) -> None:
     if str(row.get("createBy") or "").lower() == "demo":
         raise _refused("this is a demo profile (createBy=demo): the website refuses to operate on demo data, "
-                       "and so does this tool. Nothing was sent.")
+                       "and so does this tool", action=action)
 
 
 def _flag(value: Any) -> bool:
@@ -139,13 +161,12 @@ def _flag(value: Any) -> bool:
     return bool(value)
 
 
-def _refuse_unmanaged(row: dict[str, Any]) -> None:
+def _refuse_unmanaged(row: dict[str, Any], action: str) -> None:
     """The website hides Delete and Re-generate for campaign and pre-occupied profiles, so they are never sent."""
     flags = [name for name in ("campaignFlag", "preOccupy") if _flag(row.get(name))]
     if flags:
         raise _refused(f"this profile is flagged {' / '.join(flags)} (a campaign or pre-occupied profile): the website "
-                       "does not offer this action for it, so it is not sent, even with --force. "
-                       "Nothing was sent.")
+                       "does not offer this action for it, so it is not sent, even with --force", action=action)
 
 
 def _recycle_class(value: Any) -> str:
@@ -183,12 +204,12 @@ def _guard_on_phone(ctx: Ctx, row: dict[str, Any], recycle: tuple[str, str] | No
                     warning: str | None, notes: list[str], mode: str) -> None:
     """Refuse (unless --force) unless the profile is known to be off a phone; appends notes.
 
-    `mode` is 'delete', 'regenerate' or 'recycle'. For recycle, being on a phone is expected (the caller
+    `action` is the sentence the dry run shows in its Action row. `mode` is 'delete', 'regenerate' or 'recycle'. For recycle, being on a phone is expected (the caller
     already required AWAITING), so only a missing or unrecognised status refuses. `recycle` is the
     (class, description) of the ICCID's recycle state, None for 'recycle'."""
-    _refuse_demo(row)
+    _refuse_demo(row, action)
     if mode != "recycle":
-        _refuse_unmanaged(row)
+        _refuse_unmanaged(row, action)
     raw = str(row.get("status") or "")
     token = normalize_status(raw)
     reasons: list[str] = []
@@ -216,13 +237,13 @@ def _guard_on_phone(ctx: Ctx, row: dict[str, Any], recycle: tuple[str, str] | No
         elif state == "unknown":
             reasons.append(why)
     if reasons:
-        said = (" The website warns: \"" + warning + "\"") if website_text and warning else ""
+        said = (" The website warns: \"" + warning + "\" (--force overrides it).") if website_text and warning else ""
         if not ctx.args.force:
-            raise _refused(f"refusing to {action} {row.get('iccid')}: " + "; ".join(reasons) + "." + said
-                           + " Nothing was sent. If you are sure, repeat with --force (and --yes).")
+            raise Refusal(reasons, action=action, website=warning if website_text else None,
+                          override="if you are sure, repeat with --force (and --yes).")
         notes.append("FORCED (--force): " + "; ".join(reasons) + "." + said)
     if token in _NOT_PROOF_STATES and not (mode == "regenerate" and token in _BOOKKEEPING_STATES):
-        notes.append(f"status {token} is platform bookkeeping, {NOT_PROOF}: the profile may still be installed.")
+        notes.append(f"Status {token} is platform bookkeeping, {NOT_PROOF}: the profile may still be installed.")
 
 
 def _text_arg(value: str, limit: int, what: str, allow_empty: bool = False) -> str:
@@ -241,13 +262,17 @@ def cmd_portal_notes(ctx: Ctx) -> int:
     if not a.clear and a.text is None:
         raise UsageError("give the note text, or --clear to empty it")
     text = "" if a.clear else _text_arg(a.text, NOTES_MAX, "the note")
+    action = f"{'Clear' if a.clear else 'Replace'} the note on profile {iccid}."
     row = find_profile(ctx, iccid)
-    _refuse_demo(row)
-    notes = [f"current note: {row.get('notes')!r}"] if row.get("notes") not in (None, "") else []
+    _refuse_demo(row, action)
+    notes = [f"Current note: {row.get('notes')!r}."] if row.get("notes") not in (None, "") else []
     obj = portal_mutate(
         ctx, path=portal.PATH_FLEET_UPDATE_NOTES, body={"ids": [_profile_id(row)], "notes": text},
         effect="replaces the profile's note on the platform (metadata only; nothing on a phone changes)",
-        cost="no charge", notes=notes, context=_context(row), check_hint=f"Check with `simlessly portal profile {iccid}`")
+        cost="no charge documented", notes=notes, context=_context(row),
+        check_hint=f"Check with `simlessly portal profile {iccid}`", action=action,
+        rows=[("New note", "(empty: the note is cleared)" if a.clear else repr(text))],
+        then=[f"simlessly portal profile {iccid}"])
     return _finish(ctx, obj, f"Notes for {iccid} " + ("cleared." if a.clear else "updated."))
 
 
@@ -268,12 +293,15 @@ def _resolve_group(ctx: Ctx, value: str) -> tuple[Any, str]:
 def cmd_portal_group_assign(ctx: Ctx) -> int:
     iccid = iccid_arg(ctx.args.iccid)
     row = find_profile(ctx, iccid)
-    _refuse_demo(row)
     group_id, group_name = _resolve_group(ctx, ctx.args.group)
+    action = f"Put profile {iccid} into the group {group_name!r}."
+    _refuse_demo(row, action)
     obj = portal_mutate(
         ctx, path=portal.PATH_GROUP_BATCH, body={"groupId": group_id, "profileIds": [_profile_id(row)]},
         effect=f"puts the profile into the group {group_name!r} (metadata only; nothing on a phone changes)",
-        cost="no charge", context=_context(row), check_hint=f"Check with `simlessly portal profile {iccid}`")
+        cost="no charge documented", context=_context(row), check_hint=f"Check with `simlessly portal profile {iccid}`",
+        action=action,
+        rows=[("Group", f"{group_name} (id {group_id})")], then=[f"simlessly portal profile {iccid}"])
     return _finish(ctx, obj, f"{iccid} is now in group {group_name!r}.")
 
 
@@ -283,12 +311,20 @@ def cmd_portal_group_create(ctx: Ctx) -> int:
     note = _text_arg(a.note, GROUP_NOTE_MAX, "--note", allow_empty=True)
     obj = portal_mutate(
         ctx, path=portal.PATH_GROUP_ADD, body={"name": name, "note": note},
-        effect=f"creates the profile group {name!r} (metadata only)", cost="no charge",
-        check_hint="Check with `simlessly portal groups`")
+        effect=f"creates the profile group {name!r} (metadata only)", cost="no charge documented",
+        check_hint="Check with `simlessly portal groups`", action=f"Create the profile group {name!r}.",
+        rows=[("Group", name), ("Note", note if note else "(none)")], then=["simlessly portal groups"])
     return _finish(ctx, obj, f"Group {name!r} created.")
 
 
 # ------------------------------------------------------------------ re-generate, recycle, delete
+
+_FORMAT_NAMES = {"STRING": "activation code text", "PICTURE": "QR picture", "AC_LINK": "activation link"}
+
+
+def _format_names(formats: list[str]) -> str:
+    return ", ".join(f"{_FORMAT_NAMES.get(f, f)} ({f})" for f in formats)
+
 
 _EXPIRE_RE = re.compile(r"(\d{4})[/-](\d{2})[/-](\d{2})[ T](\d{2}):(\d{2}):(\d{2})")
 
@@ -309,11 +345,12 @@ def cmd_portal_regenerate(ctx: Ctx) -> int:
     a = ctx.args
     iccid = iccid_arg(a.iccid)
     expire = _expire_time(a.expire_time) if a.expire_time else None
+    action = f"Issue a new activation code for profile {iccid}."
     row = find_profile(ctx, iccid)
     notes: list[str] = []
-    _refuse_demo(row)
-    _refuse_unmanaged(row)
-    _guard_on_phone(ctx, row, _recycle_state(ctx, row, iccid), action="re-generate the activation code of",
+    _refuse_demo(row, action)
+    _refuse_unmanaged(row, action)
+    _guard_on_phone(ctx, row, _recycle_state(ctx, row, iccid), action=action,
                     warning=WARN_REGENERATE, notes=notes, mode="regenerate")
     config_id = row.get("configId")
     if isinstance(config_id, bool) or not isinstance(config_id, (int, str)) or config_id == "":
@@ -324,17 +361,23 @@ def cmd_portal_regenerate(ctx: Ctx) -> int:
     if a.picture:
         notes.append("PICTURE is refused by the portal on a BASIC plan (BASIC only offers STRING).")
     if expire:
-        notes.append("expireTime only applies to Recycle / Custom configurations.")
-    notes.append("the portal runs this as an asynchronous batch task (type RE_GENERATE): follow it with "
+        notes.append("The expireTime option only applies to Recycle / Custom configurations.")
+    human_notes = list(notes) + ["The portal runs this as an asynchronous batch task (type RE_GENERATE); the new code "
+                                 "then appears in `simlessly portal profile`."]
+    notes.append("The portal runs this as an asynchronous batch task (type RE_GENERATE): follow it with "
                  "`simlessly portal batch-logs --type RE_GENERATE`; the new code is then in `portal profile`.")
+    config_name = row.get("configName") or row.get("configurationName")
     obj = portal_mutate(
         ctx, path=portal.PATH_FLEET_RE_GENERATE, body=body,
         effect="issues a new activation code for the profile; the previous code may stop working, and a profile "
                "already on a phone may break",
         cost="BILLABLE: may count as a new download on the plan once the new code is installed",
-        notes=notes, context=_context(row), check_hint=f"Check with `simlessly portal profile {iccid}` and `simlessly portal batch-logs`")
-    return _finish(ctx, obj, f"Re-generate submitted for {iccid}. The portal processes it in the background: "
-                             "`simlessly portal batch-logs --type RE_GENERATE`.")
+        notes=notes, context=_context(row), check_hint=f"Check with `simlessly portal profile {iccid}` and `simlessly portal batch-logs`",
+        action=action,
+        rows=[("Config", f"{config_name} ({config_id})" if config_name else str(config_id)),
+              ("Format", _format_names(formats)), *([("Expires", expire)] if expire else [])],
+        human_notes=human_notes, then=["simlessly portal batch-logs --type RE_GENERATE", f"simlessly portal profile {iccid}"])
+    return _finish(ctx, obj, f"Re-generate submitted for {iccid}. The portal processes it in the background.")
 
 
 _AT_RE = re.compile(r"(\d{4})[/-](\d{2})[/-](\d{2})[ T](\d{2})(?::00(?::00)?)?")
@@ -358,40 +401,46 @@ def cmd_portal_recycle(ctx: Ctx) -> int:
     a = ctx.args
     iccid = iccid_arg(a.iccid)
     when = _recycle_time(a.at)
+    action = f"Set the recycle time of profile {iccid} to {when}."
     row = find_profile(ctx, iccid)
-    _refuse_demo(row)
+    _refuse_demo(row, action)
     state, why = _recycle_state(ctx, row, iccid)
     if normalize_status(row.get("status")) == "AVAILABLE":
-        raise _refused("the website only offers a recycle-time change for a profile that is not AVAILABLE. Nothing was sent.")
+        raise _refused("the website only offers a recycle-time change for a profile that is not AVAILABLE", action=action)
     if state != "awaiting":
         raise _refused("the website only offers a recycle-time change while this profile's recycle state is AWAITING "
-                       f"({why or 'its recycle state is not AWAITING'}; see `simlessly portal recycle-status`). Nothing was sent.")
+                       f"({why or 'its recycle state is not AWAITING'}; see `simlessly portal recycle-status`)",
+                       action=action)
     notes: list[str] = []
-    _guard_on_phone(ctx, row, None, action="change the recycle time of", warning=None, notes=notes, mode="recycle")
-    notes.append("the time is sent as typed; the portal's time zone for it is not documented (the website sends the "
+    _guard_on_phone(ctx, row, None, action=action, warning=None, notes=notes, mode="recycle")
+    notes.append("The time is sent as typed; the portal's time zone for it is not documented (the website sends the "
                  "date picker's value). Only the 'Other time' form is supported, not 'Now'.")
     obj = portal_mutate(
         ctx, path=portal.PATH_FLEET_RECYCLE, body={"iccid": iccid, "recycleTime": when},
         effect="schedules the recycle applet to remove the profile from the phone at its next connection after that time",
         cost="no charge documented", notes=notes, context=_context(row),
-        check_hint=f"Check with `simlessly portal recycle-status {iccid}`")
+        check_hint=f"Check with `simlessly portal recycle-status {iccid}`",
+        action=action, rows=[("Recycle at", when)],
+        then=[f"simlessly portal recycle-status {iccid}"])
     return _finish(ctx, obj, f"Recycle time for {iccid} set to {when}.")
 
 
 def cmd_portal_delete(ctx: Ctx) -> int:
     iccid = iccid_arg(ctx.args.iccid)
+    action = f"Delete profile {iccid} from the platform."
     row = find_profile(ctx, iccid)
     notes: list[str] = []
-    _refuse_demo(row)
-    _refuse_unmanaged(row)
-    _guard_on_phone(ctx, row, _recycle_state(ctx, row, iccid), action="delete", warning=WARN_DELETE, notes=notes,
+    _refuse_demo(row, action)
+    _refuse_unmanaged(row, action)
+    _guard_on_phone(ctx, row, _recycle_state(ctx, row, iccid), action=action, warning=WARN_DELETE, notes=notes,
                     mode="delete")
-    notes.append("deleting a profile from the platform does not remove it from a device.")
+    notes.append("Deleting a profile from the platform does not remove it from a device.")
     obj = portal_mutate(
         ctx, path=portal.PATH_FLEET_DELETE, body={"ids": [_profile_id(row)]},
         effect="deletes the profile from the platform (irreversible; it is not removed from any device)",
         cost="no charge documented", notes=notes, context=_context(row),
-        check_hint=f"Check with `simlessly portal profile {iccid}`")
+        check_hint=f"Check with `simlessly portal profile {iccid}`",
+        action=action, then=[f"simlessly portal profile {iccid}"])
     return _finish(ctx, obj, f"Deleted {iccid} from the platform.")
 
 
@@ -421,29 +470,50 @@ def cmd_portal_generate_ac(ctx: Ctx) -> int:
         raise UsageError("--file: cannot read that file") from None
     if len(content) > MAX_UPLOAD_BYTES:
         raise UsageError(f"--file must be between 1 byte and {MAX_UPLOAD_BYTES >> 20} MiB")
-    config_id = _resolve_config(ctx, a.config)
+    filename = os.path.basename(path)
+    action = f"Upload {filename} and create profiles from its records."
+    config_id, config_name = _resolve_config_named(ctx, a.config)
     plan = _need_dict(_read(ctx, portal.PATH_PLAN_QUERY_ORDER, {}), "subscription")
     ac_count = _need_dict(_read(ctx, portal.PATH_ANALYTIC_AC_COUNT, {}), "AC count").get("acCount")
     plan_type = str(plan.get("planType") or "").strip().upper()
     if plan_type == "DEFAULT" and (isinstance(ac_count, bool) or not isinstance(ac_count, int) or ac_count >= 1):
         raise _refused(f"the free (DEFAULT) plan is limited to 1 profile and this account already has acCount={ac_count!r}: "
-                       "the website blocks the upload in that case, so it is not sent. Nothing was sent.")
+                       "the website blocks the upload in that case, so it is not sent", action=action)
     formats = ["STRING"] + (["PICTURE"] if a.picture else []) + (["AC_LINK"] if a.ac_link else [])
     fields = [("configId", str(config_id)), ("uploadType", "1" if a.upload_type == "pgp" else "0")]
     fields += [("acFormats", f) for f in formats]
-    notes = [f"plan check (as the website does): planType={plan.get('planType')!r}, acCount={ac_count!r}",
-             "creates one profile per record in the file (the portal allows up to 10,000 records per file); "
+    look = ctx.look
+    notes = [f"Plan check (as the website does): planType={plan.get('planType')!r}, acCount={ac_count!r}.",
+             "Creates one profile per record in the file (the portal allows up to 10,000 records per file); "
              "the free (DEFAULT) plan is limited to 1 profile.",
-             "the portal runs this as an asynchronous batch task: follow it with `simlessly portal batch-logs`."]
+             "The portal runs this as an asynchronous batch task: follow it with `simlessly portal batch-logs`."]
+    human_notes = ["Creates one profile per record in the file (the portal allows up to 10,000 records per file); "
+                   "the free (DEFAULT) plan is limited to 1 profile.",
+                   "The portal runs this as an asynchronous batch task."]
     if a.upload_type == "plain":
-        notes.append("WARNING: a plain spreadsheet sends the SIM keys (Ki / OPc) to Simlessly without the PGP layer (only "
-                     "TLS protects them); encrypt the file with the portal's PGP key and use --upload-type pgp when you can.")
+        warning = ("WARNING: a plain spreadsheet sends the SIM keys (Ki / OPc) to Simlessly without the PGP layer (only "
+                   "TLS protects them); encrypt the file with the portal's PGP key and use --upload-type pgp when you can.")
+        notes.append(warning)
+        human_notes.append(warning)
+    digest = hashlib.sha256(content).hexdigest()
+    plan_text = str(plan.get("planType") or "unknown plan")
+    generated = (f"{pluralize(ac_count, 'profile')} generated so far"
+                 if isinstance(ac_count, int) and not isinstance(ac_count, bool) else "profiles generated: not reported")
+    plan_row = look.sep.join([plan_text, generated, "checked as the website does"])
+    rows = [("Config", f"{config_name} ({config_id})" if config_name else str(config_id)),
+            ("File", look.sep.join([filename, f"{len(content):,} bytes", f"sha256 {digest[:8]}{look.dots}",
+                                    "PGP encrypted" if a.upload_type == "pgp" else "plain spreadsheet (no PGP layer)",
+                                    "content not shown"])),
+            ("Format", _format_names(formats)),
+            ("Plan", plan_row)]
     obj = portal_mutate(
         ctx, path=portal.PATH_FLEET_GENERATE_AC, upload={"fields": fields, "filename": os.path.basename(path), "content": content},
         effect="creates profiles (and activation codes) for every record in the uploaded file",
         cost="BILLABLE: creates profiles and uses plan quota; uploads the file's SIM key material",
-        notes=notes, check_hint="Check with `simlessly portal batch-logs` and `simlessly portal fleet`")
-    return _finish(ctx, obj, "Upload accepted. The portal processes it in the background: `simlessly portal batch-logs`.")
+        notes=notes, check_hint="Check with `simlessly portal batch-logs` and `simlessly portal fleet`",
+        action=action, rows=rows, human_notes=human_notes,
+        then=["simlessly portal batch-logs", "simlessly portal fleet"])
+    return _finish(ctx, obj, "Upload accepted. The portal processes it in the background.")
 
 
 # ------------------------------------------------------------------ parser

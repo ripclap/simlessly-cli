@@ -156,6 +156,11 @@ without the PGP layer.
 
 - Without `--yes`, a state-changing command prints the request it would send, secrets redacted, and sends nothing
   (exit 2). Portal dry runs still make read-only lookups. `--yes` must be spelled in full.
+- The preview lists the action, the cost, the target or inputs, the effect and the request (method and URL), then
+  notes and the next step. Secret values show as `[redacted]`. `--debug` adds the request headers and, for a file
+  upload, the raw form fields. Long lines wrap to the terminal width (`COLUMNS` overrides it). Bold labels and a
+  highlighted `BILLABLE`, `CAUTION`, `FORCED`, `WARNING` or `OUTCOME UNKNOWN` appear only on a terminal and not
+  when `NO_COLOR` is set. `--json` keeps the same fields.
 - With `--yes` the request is sent once. There are no retries. Commands that may use a download credit say so in
   the preview. `profile delete` never sends `force: true`.
 - If the outcome is unknown (timeout, dropped connection, 5xx, unreadable answer), the command exits 3. Check the
@@ -167,6 +172,30 @@ without the PGP layer.
 | 1 | failure: bad settings, HTTP or connection error, request refused by Simlessly, guard refusal |
 | 2 | usage error or dry run |
 | 3 | outcome unknown after a state-changing request |
+
+Example preview (fabricated values):
+
+```
+$ simlessly profile delete 8999000000000000001
+Dry run — nothing has been sent.
+
+Action   Delete profile 8999000000000000001 from the Simlessly platform.
+Cost     no charge documented
+Target   ICCID 8999000000000000001
+Effect   removes the profile and its activation code from the Simlessly platform (status REMOVED)
+Request  POST https://rsp.simlessly.com/api/v1/profile/delete
+Body     {"iccid":"8999000000000000001","force":false}
+
+Notes
+  - Platform-side only; do not delete while the line is still enabled or disabled on a device. The
+    documented 'force' option is never set to true.
+
+To send:  add --yes
+Then:     simlessly profile show 8999000000000000001
+```
+
+With `--yes` the output starts with `Sent.` and what happened, then any result, the request and the next step.
+A refused request prints `Refused. Nothing was sent.` followed by the action and the reasons.
 
 ## Output and masking
 

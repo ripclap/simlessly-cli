@@ -19,11 +19,12 @@ import getpass
 import json
 import os
 import re
+import shlex
 import shutil
 import sys
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Callable, TextIO
+from typing import Any, Callable, Mapping, Sequence, TextIO
 
 from . import __version__, client as api
 from .client import Client, SimlesslyError
@@ -32,7 +33,10 @@ from .config import (
     ENV_VARS, REQUIRED, SECRET_SETTINGS, ConfigError, KeychainLookup, Settings, keychain_lookup, validate_base_url,
 )
 from .output import (
-    Redactor, clean, dumps, kv, mask_tail, normalize_status, sanitize, status_meaning, table,
+    Redactor, clean, dumps, kv, mask_tail, mask_text, normalize_status, sanitize, status_meaning, table,
+)
+from .preview import (
+    Look, Preview, Refusal, look_for, render_preview, render_refusal, render_sent, render_unknown,
 )
 
 EXIT_OK, EXIT_FAIL, EXIT_USAGE, EXIT_UNKNOWN = 0, 1, 2, 3
@@ -65,7 +69,9 @@ class Ctx:
     err: TextIO
     stdin: TextIO
     backends: "stores.Backends | None" = None
+    env: Mapping[str, str] | None = None  # for COLUMNS, NO_COLOR and TERM
     mutated: bool = False  # set once a state-changing request is sent
+    sent: tuple[str, str, tuple[str, ...]] | None = None  # (method, url, follow-up commands) of that request
     # Advice after an unknown outcome. The portal write commands replace it.
     check_hint: str = "Check the profile with `simlessly profile show <iccid>`"
 
@@ -77,6 +83,17 @@ class Ctx:
 
     def show_json(self, value: Any) -> None:
         self.say(dumps(value))
+
+    @property
+    def look(self) -> Look:
+        return look_for(self.out, self.env)
+
+    def confirm(self, done: str, detail: str | None = None) -> None:
+        """Print the "Sent." confirmation for the state-changing request that went through, with the result
+        block `detail` (already laid out and masked) between that line and the request."""
+        method, url, then = self.sent or (None, None, ())
+        done = mask_text(done, self.redactor, imsi_text=True)
+        self.say(render_sent(done, method, url, then, self.look, detail))
 
     def client(self) -> Client:
         access, secret = self.settings.require("access-key"), self.settings.require("secret-key")
@@ -134,8 +151,11 @@ def read_secret(ctx: Ctx, flag: str | None, env_name: str, label: str, required:
 # ------------------------------------------------------------------ the safety gate
 
 def mutate(ctx: Ctx, *, path: str, body: dict[str, Any], effect: str, cost: str | None = None,
-           note: str | None = None) -> Any:
-    """Send a state-changing request once, only with --yes. Without it, print the preview and raise DryRun."""
+           note: str | None = None, action: str | None = None, rows: Sequence[tuple[str, str]] = (),
+           then: Sequence[str] = ()) -> Any:
+    """Send a state-changing request once, only with --yes. Without it, print the preview and raise DryRun.
+
+    `action` is one plain sentence, `rows` the specifics (target, config...), `then` the follow-up commands."""
     url = api.build_url(ctx.settings.base_url(), path)
     # None values are dropped, as when serializing.
     shown_body = sanitize({k: v for k, v in body.items() if v is not None}, ctx.redactor, reveal=True)
@@ -143,20 +163,22 @@ def mutate(ctx: Ctx, *, path: str, body: dict[str, Any], effect: str, cost: str 
         if ctx.args.json:
             ctx.show_json({"dry_run": True, "method": "POST", "url": url, "body": shown_body,
                            "effect": effect, "cost": cost})
+            ctx.warn("dry run: nothing was sent. Add --yes to send this request.")
         else:
-            ctx.say("Would send (dry run, nothing sent yet):")
-            ctx.say(kv([
-                ("request", f"POST {url}"),
-                ("headers", "Content-Type: application/json, plus AccessKey, Timestamp, RequestID and "
-                            "Signature added at send time (values not shown)"),
-                ("body", json.dumps(shown_body, separators=(",", ":"), ensure_ascii=False)),
-                ("effect", effect),
-                ("cost", cost or "no charge documented"),
-                *([("note", note)] if note else []),
-            ]))
-        ctx.warn("dry run: nothing was sent. Add --yes to send this request.")
+            hidden = [k for k, v in shown_body.items() if v == "[redacted]"]
+            preview = Preview(
+                action=action or effect[:1].upper() + effect[1:], cost=cost or "no charge documented", effect=effect,
+                method="POST", url=url, rows=list(rows),
+                body=json.dumps(shown_body, separators=(",", ":"), ensure_ascii=False),
+                notes=([note] if note else []) + ([f"Secret values are never printed: {', '.join(hidden)} "
+                                                   "show as [redacted]."] if hidden else []),
+                then=list(then),
+                debug_rows=[("Headers", "Content-Type: application/json, plus AccessKey, Timestamp, RequestID and "
+                                        "Signature added at send time (values not shown)")])
+            ctx.say(render_preview(preview, ctx.look, debug=ctx.args.debug))
         raise DryRun
     ctx.mutated = True
+    ctx.sent = ("POST", url, tuple(then))
     return ctx.client().post(path, body)
 
 
@@ -478,7 +500,10 @@ def cmd_ac_generate(ctx: Ctx) -> int:
         effect="creates a profile for this SIM and returns a live activation code that a phone can install",
         cost="may cost money: installing the code consumes a Simlessly download credit; "
              "it also sends the SIM's secret keys to Simlessly",
-        note="fails if the ICCID already exists on the platform")
+        note="Fails if the ICCID already exists on the platform.",
+        action=f"Create a profile and activation code for the SIM with ICCID {iccid}.",
+        rows=[("Target", f"ICCID {iccid} (new profile)"), ("Config", config)],
+        then=[f"simlessly profile show {iccid}"])
     obj = _expect_dict(obj, "generate")
     code = obj.get("activationCode")
     if not isinstance(code, str) or not code.strip():
@@ -493,8 +518,7 @@ def cmd_ac_generate(ctx: Ctx) -> int:
     else:
         link = obj.get("acLink")
         shown = (lambda v: v) if reveal else mask_tail
-        ctx.say("Generated.")
-        ctx.say(kv([
+        ctx.confirm(f"Created a profile and activation code for ICCID {iccid}.", kv([
             ("ICCID", iccid),
             ("Activation code", shown(code)),
             ("QR payload (LPA)", shown("LPA:" + code)),
@@ -508,12 +532,13 @@ def cmd_ac_generate(ctx: Ctx) -> int:
 
 
 def _simple_mutation(ctx: Ctx, path: str, body: dict[str, Any], *, effect: str, cost: str | None,
-                     done: str, note: str | None = None) -> int:
-    obj = mutate(ctx, path=path, body=body, effect=effect, cost=cost, note=note)
+                     done: str, action: str, rows: Sequence[tuple[str, str]], then: Sequence[str],
+                     note: str | None = None) -> int:
+    obj = mutate(ctx, path=path, body=body, effect=effect, cost=cost, note=note, action=action, rows=rows, then=then)
     if ctx.args.json:
         ctx.show_json(sanitize(obj, ctx.redactor) if obj is not None else {"success": True})
     else:
-        ctx.say(done)
+        ctx.confirm(done)
     return EXIT_OK
 
 
@@ -522,8 +547,10 @@ def cmd_profile_expire(ctx: Ctx) -> int:
     return _simple_mutation(
         ctx, api.PATH_PROFILE_EXPIRED, {"iccid": iccid},
         effect="invalidates the profile's current activation code (status becomes EXPIRED)",
-        cost="no charge documented", note="use only for a download/install fault; it does not remove the "
-        "profile from a phone. Needs status Downloaded/Installed/Enabled/Disabled",
+        cost="no charge documented", note="Use only for a download/install fault; it does not remove the "
+        "profile from a phone. Needs status Downloaded/Installed/Enabled/Disabled.",
+        action=f"Expire the current activation code of profile {iccid}.",
+        rows=[("Target", f"ICCID {iccid}")], then=[f"simlessly profile show {iccid}"],
         done=f"Expired {iccid}. Status is now EXPIRED: {status_meaning('EXPIRED')}.")
 
 
@@ -532,21 +559,33 @@ def cmd_profile_delete(ctx: Ctx) -> int:
     return _simple_mutation(
         ctx, api.PATH_PROFILE_DELETE, {"iccid": iccid, "force": False},
         effect="removes the profile and its activation code from the Simlessly platform (status REMOVED)",
-        cost="no charge documented", note="platform-side only; do not delete while the line is still "
-        "enabled or disabled on a device. The documented 'force' option is never set to true",
+        cost="no charge documented", note="Platform-side only; do not delete while the line is still "
+        "enabled or disabled on a device. The documented 'force' option is never set to true.",
+        action=f"Delete profile {iccid} from the Simlessly platform.",
+        rows=[("Target", f"ICCID {iccid}")], then=[f"simlessly profile show {iccid}"],
         done=f"Deleted {iccid} from the platform. Status REMOVED: {status_meaning('REMOVED')}.")
 
 
 def cmd_order_cancel(ctx: Ctx) -> int:
     iccid = iccid_arg(ctx.args.iccid)
+    config = getattr(ctx.args, "config", None) or ctx.settings.get("config-name").value
+    if config:
+        download, extra = f"simlessly order download {iccid} --config {shlex.quote(config)}", None
+    else:
+        # Not runnable as written: CONFIG_NAME has to be replaced first.
+        download = f"simlessly order download {iccid} --config CONFIG_NAME"
+        extra = ("`order download` requires --config (or SIMLESSLY_CONFIG_NAME): replace CONFIG_NAME with the "
+                 "configuration name.")
     return _simple_mutation(
         ctx, api.PATH_ES2_CANCEL, {"iccid": iccid},
         effect="ES2+ step 1 of 3: cancels the current order, so the old activation code stops working "
                "(status becomes CANCELED)",
-        cost="no charge documented", note="needs status Available or Error. After this the profile has no usable "
-        "code until you run `order download` then `order confirm`",
-        done=f"Cancelled the order for {iccid}. Status CANCELED: {status_meaning('CANCELED')}. "
-             "Next: simlessly order download, then order confirm.")
+        cost="no charge documented", note="Needs status Available or Error. After this the profile has no usable "
+        "code until you run `order download` then `order confirm`." + (f" {extra}" if extra else ""),
+        action=f"Cancel the current order for profile {iccid} (step 1 of 3).",
+        rows=[("Target", f"ICCID {iccid}")],
+        then=[download, f"simlessly order confirm {iccid}"],
+        done=f"Cancelled the order for {iccid}. Status CANCELED: {status_meaning('CANCELED')}.")
 
 
 def cmd_order_download(ctx: Ctx) -> int:
@@ -557,8 +596,10 @@ def cmd_order_download(ctx: Ctx) -> int:
     return _simple_mutation(
         ctx, api.PATH_ES2_DOWNLOAD, {"iccid": iccid, "configName": config},
         effect="ES2+ step 2 of 3: creates a download order for the profile (status is unchanged)",
-        cost="may cost money as part of issuing a new code", note="then run `order confirm`",
-        done=f"Download order created for {iccid}. Next: simlessly order confirm {iccid} --yes.")
+        cost="may cost money as part of issuing a new code",
+        action=f"Create a download order for profile {iccid} (step 2 of 3).",
+        rows=[("Target", f"ICCID {iccid}"), ("Config", config)], then=[f"simlessly order confirm {iccid}"],
+        done=f"Download order created for {iccid}.")
 
 
 def cmd_order_confirm(ctx: Ctx) -> int:
@@ -567,17 +608,18 @@ def cmd_order_confirm(ctx: Ctx) -> int:
         ctx, path=api.PATH_ES2_CONFIRM, body={"iccid": iccid, "confirmationCode": "", "ac": ""},
         effect="ES2+ step 3 of 3: confirms the order and issues a new activation code (status becomes AVAILABLE)",
         cost="may cost money: installing the new code is a new download credit",
-        note="the new code is masked unless --reveal-ac is given")
+        note="The new code is masked unless --reveal-ac is given.",
+        action=f"Confirm the order for profile {iccid} and issue a new activation code (step 3 of 3).",
+        rows=[("Target", f"ICCID {iccid}")], then=[f"simlessly profile show {iccid}"])
     reveal = ctx.args.reveal_ac
     view = sanitize(obj, ctx.redactor, reveal) if isinstance(obj, dict) else None
     if ctx.args.json:
         ctx.show_json(view if view is not None else {"success": True})
     elif view and view.get("ac"):
-        ctx.say(f"Confirmed {iccid}. New code issued.")
-        ctx.say(kv([("Activation code", view["ac"]), *([("EID", view["eid"])] if view.get("eid") else [])]))
+        ctx.confirm(f"Confirmed {iccid}. New code issued.",
+                    kv([("Activation code", view["ac"]), *([("EID", view["eid"])] if view.get("eid") else [])]))
     else:
-        ctx.say(f"Confirmed {iccid}, but Simlessly returned no activation code. "
-                f"Check with: simlessly profile show {iccid}")
+        ctx.confirm(f"Confirmed {iccid}, but Simlessly returned no activation code.")
     if reveal and view and view.get("ac"):
         ctx.warn("warning: the activation code is a bearer secret. Keep it private.")
     return EXIT_OK
@@ -733,7 +775,7 @@ def main(argv: list[str] | None = None, *, env=None, keychain: KeychainLookup | 
     source = (stores.os_store_name() or "keychain") if keychain is keychain_lookup else "keychain"
     settings = Settings(env, keychain, overrides={"base-url": args.base_url},
                         file_store=credentials_file, keychain_source=source)
-    ctx = Ctx(args, settings, Redactor(), out, err, inp, backends or stores.Backends(env))
+    ctx = Ctx(args, settings, Redactor(), out, err, inp, backends or stores.Backends(env), env=env)
     try:
         return args.func(ctx)
     except DryRun:
@@ -744,18 +786,19 @@ def main(argv: list[str] | None = None, *, env=None, keychain: KeychainLookup | 
     except ConfigError as e:
         err.write(f"error: {e}\n")
         return EXIT_FAIL
+    except Refusal as e:
+        err.write(mask_text(render_refusal(e, look_for(err, env)), ctx.redactor, imsi_text=True) + "\n")
+        return EXIT_FAIL
     except SimlesslyError as e:
         err.write(f"error: {ctx.redactor.scrub(str(e))}\n")
         if ctx.mutated and e.outcome_unknown:
-            err.write(f"OUTCOME UNKNOWN: Simlessly may have acted. Nothing was retried. {ctx.check_hint} "
-                      "before sending again.\n")
+            err.write(render_unknown(ctx.check_hint, look_for(err, env)) + "\n")
             return EXIT_UNKNOWN
         return EXIT_FAIL
     except Exception as e:  # last resort; a raw traceback could quote a credential
         err.write(f"error: unexpected {type(e).__name__}: {ctx.redactor.scrub(clean(str(e), 200))}\n")
         if ctx.mutated:
-            err.write(f"OUTCOME UNKNOWN: Simlessly may have acted. Nothing was retried. {ctx.check_hint} "
-                      "before sending again.\n")
+            err.write(render_unknown(ctx.check_hint, look_for(err, env)) + "\n")
             return EXIT_UNKNOWN
         return EXIT_FAIL
     finally:

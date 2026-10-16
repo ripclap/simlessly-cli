@@ -211,7 +211,9 @@ class CliTestCase(unittest.TestCase):
 
     def run_cli(self, *argv, env=None, keychain=None, stdin=None):
         out, err = io.StringIO(), io.StringIO()
-        code = main(list(argv), env=self.env if env is None else env, keychain=keychain,
+        env = dict(self.env if env is None else env)
+        env.setdefault("COLUMNS", "400")      # wide, so previews do not wrap; the wrapping has its own tests
+        code = main(list(argv), env=env, keychain=keychain,
                     stdout=out, stderr=err, stdin=stdin or io.StringIO())
         return code, out.getvalue(), err.getvalue()
 

@@ -315,7 +315,9 @@ class EntryPointTests(CliTestCase):
     def test_dry_run_exit_code_from_real_process(self):
         done = self.run_module("profile", "delete", ICCID)
         self.assertEqual(done.returncode, 2)
-        self.assertIn("dry run", done.stderr)
+        self.assertIn("Dry run", done.stdout)
+        self.assertIn("To send:", done.stdout)
+        self.assertEqual(done.stderr, "")
 
     def test_usage_errors(self):
         self.assertEqual(self.run_module("bogus").returncode, 2)

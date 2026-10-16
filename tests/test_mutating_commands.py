@@ -1,5 +1,6 @@
 import io
 import json
+import re
 
 import support
 from support import AC, AC_LINK, EID, ICCID, IMSI, KI, OPC, CliTestCase, ok
@@ -26,7 +27,9 @@ class DryRunTests(CliTestCase):
             with self.subTest(argv=argv):
                 code, out, err = self.run_cli(*argv)
                 self.assertEqual(code, 2)
-                self.assertIn("dry run", err)
+                self.assertTrue(out.startswith("Dry run"), out)
+                self.assertIn("add --yes", out)
+                self.assertEqual(err, "")
                 self.assertIn("POST " + self.server.url, out)
                 self.assertNoSecrets(out, err)
         self.assertEqual(self.server.requests, [])
@@ -107,10 +110,11 @@ class GenerateTests(CliTestCase):
             for stdin in (None, Tty()):
                 code, out, err = self.run_cli(*GEN_ARGS, stdin=stdin)
                 self.assertEqual(code, 2)
-                self.assertIn("Would send", out)
+                self.assertIn("Dry run", out)
                 self.assertIn('"ki":"[redacted]"', out)
+                self.assertIn("ki show as [redacted]", out)
                 self.assertNotIn("opc", out)
-                self.assertIn("dry run", err)
+                self.assertIn("add --yes", out)
                 self.assertNotIn("is required", err)
         finally:
             getpass.getpass = orig
@@ -246,6 +250,97 @@ class OtherMutationTests(CliTestCase):
         code, _, err = self.run_cli("order", "download", ICCID, "--yes")
         self.assertEqual(code, 2)
         self.assertEqual(self.server.requests, [])
+
+
+class SentConfirmationTests(CliTestCase):
+    def setUp(self):
+        super().setUp()
+        self.env.update({"SIMLESSLY_SIM_KI": KI, "SIMLESSLY_SIM_OPC": OPC})
+        self.server.routes["/api/v2/ac/generate"] = lambda r: ok({"iccid": ICCID, "activationCode": AC, "acLink": AC_LINK})
+        self.server.routes["/gsma/rsp2/es2plus/confirmOrder"] = lambda r: ok({"eid": EID, "ac": AC})
+
+    def assertOrder(self, text, *parts):
+        positions = [text.index(part) for part in parts]
+        self.assertEqual(positions, sorted(positions), (parts, text))
+
+    def test_ac_generate_prints_sent_then_the_result_block_then_request_and_next_step(self):
+        code, out, err = self.run_cli(*GEN_ARGS, "--yes")
+        self.assertEqual(code, 0, err)
+        self.assertTrue(out.startswith(f"Sent. Created a profile and activation code for ICCID {ICCID}.\n\n"), out)
+        self.assertNotIn("Generated.", out)
+        self.assertOrder(out, "Sent.", "ICCID", "Activation code", "QR payload (LPA)", "QR image link",
+                         "Request  POST " + self.server.url + "/api/v2/ac/generate",
+                         f"Then:    simlessly profile show {ICCID}")
+        self.assertIn("****6789", out)
+        for secret in (AC, AC_LINK):
+            self.assertNotIn(secret, out + err)
+        self.assertNoSecrets(out, err)
+        code, out, err = self.run_cli(*GEN_ARGS, "--yes", "--reveal-ac")
+        self.assertRegex(out, r"Activation code +" + re.escape(AC))
+        self.assertTrue(out.startswith("Sent."), out)
+
+    def test_order_confirm_prints_sent_then_the_result_block_then_request_and_next_step(self):
+        code, out, err = self.run_cli("order", "confirm", ICCID, "--yes")
+        self.assertEqual(code, 0, err)
+        self.assertTrue(out.startswith(f"Sent. Confirmed {ICCID}. New code issued.\n\n"), out)
+        self.assertOrder(out, "Sent.", "Activation code", "EID",
+                         "Request  POST " + self.server.url + "/gsma/rsp2/es2plus/confirmOrder",
+                         f"Then:    simlessly profile show {ICCID}")
+        self.assertIn("****6789", out)
+        self.assertNotIn(AC, out)
+        self.assertNotIn(EID, out)
+        code, out, err = self.run_cli("order", "confirm", ICCID, "--yes", "--reveal-ac")
+        self.assertRegex(out, r"Activation code +" + re.escape(AC))
+
+    def test_order_confirm_without_a_code_still_says_sent_and_what_to_do_next(self):
+        self.server.routes["/gsma/rsp2/es2plus/confirmOrder"] = lambda r: ok(None)
+        code, out, err = self.run_cli("order", "confirm", ICCID, "--yes")
+        self.assertEqual(code, 0, err)
+        self.assertTrue(out.startswith(f"Sent. Confirmed {ICCID}, but Simlessly returned no activation code."), out)
+        self.assertIn(f"Then:    simlessly profile show {ICCID}", out)
+
+    def test_json_output_is_unchanged(self):
+        code, out, err = self.run_cli(*GEN_ARGS, "--yes", "--json")
+        self.assertEqual(json.loads(out), {"iccid": ICCID, "activationCode": "****6789",
+                                           "acLink": "****" + AC_LINK[-4:]})
+        code, out, err = self.run_cli("order", "confirm", ICCID, "--yes", "--json")
+        self.assertEqual(json.loads(out), {"eid": "****" + EID[-4:], "ac": "****6789"})
+
+
+class OrderCancelNextStepTests(CliTestCase):
+    def then_lines(self, out):
+        lines = out.rstrip("\n").split("\n")
+        return lines[lines.index(next(ln for ln in lines if ln.startswith("Then:"))):]
+
+    def test_a_known_config_is_quoted_into_the_next_step(self):
+        self.env["SIMLESSLY_CONFIG_NAME"] = "My Config; rm -rf x"
+        code, out, err = self.run_cli("order", "cancel", ICCID)
+        self.assertEqual(code, 2)
+        self.assertIn(f"Then:     simlessly order download {ICCID} --config 'My Config; rm -rf x'\n", out)
+        for line in self.then_lines(out):                # a next step is previewed first, never pre-approved
+            self.assertNotIn("--yes", line)
+        self.assertNotIn("CONFIG_NAME", out)
+        self.assertNotIn("requires --config", out)
+        self.server.routes["/gsma/rsp2/es2plus/cancelOrder"] = lambda r: ok(None)
+        code, out, err = self.run_cli("order", "cancel", ICCID, "--yes")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.then_lines(out), [
+            f"Then:    simlessly order download {ICCID} --config 'My Config; rm -rf x'",
+            f"         simlessly order confirm {ICCID}"])
+
+    def test_an_unknown_config_gets_a_placeholder_that_cannot_send_anything_and_a_note(self):
+        self.assertNotIn("SIMLESSLY_CONFIG_NAME", self.env)
+        code, out, err = self.run_cli("order", "cancel", ICCID)
+        self.assertEqual(code, 2)
+        self.assertIn(f"Then:     simlessly order download {ICCID} --config CONFIG_NAME\n", out)
+        self.assertNotIn("<name>", out)
+        self.assertIn("requires --config", out)
+        self.assertIn("replace CONFIG_NAME", out)
+        self.server.routes["/gsma/rsp2/es2plus/cancelOrder"] = lambda r: ok(None)
+        code, out, err = self.run_cli("order", "cancel", ICCID, "--yes")
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"simlessly order download {ICCID} --config CONFIG_NAME\n", out)
+        self.assertNotIn("CONFIG_NAME --yes", out)
 
 
 class PreviewTests(CliTestCase):
